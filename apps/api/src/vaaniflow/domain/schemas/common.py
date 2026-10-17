@@ -49,6 +49,7 @@ class AudioQualityLevel(StrEnum):
     GOOD = "GOOD"
     ACCEPTABLE = "ACCEPTABLE"
     DEGRADED = "DEGRADED"
+    POOR = "POOR"
     UNUSABLE = "UNUSABLE"
 
 
