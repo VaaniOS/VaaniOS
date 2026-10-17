@@ -35,4 +35,8 @@ class Transcript(DomainSchema):
 
     segments: list[TranscriptSegment] = Field(default_factory=list)
 
+    # Opaque provider diagnostics (model name, latency, ...). Never domain
+    # state and never interpreted downstream (System-Design 20 §20.4).
+    provider_metadata: dict[str, str | int | float | bool | None] = Field(default_factory=dict)
+
     created_at: datetime
