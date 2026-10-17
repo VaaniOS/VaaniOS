@@ -50,6 +50,9 @@ Recommended top-level structure:
 }
 ```
 
+> Implemented as SemanticState 2.0 — see ADR-015 for the typed slot layout
+> (`items`, `pricing`, `tax`, slot-targeted `references`).
+
 ## 5.4 Confidence must be contextual
 
 Do not use one global confidence number as truth.
@@ -130,6 +133,9 @@ Suggested states:
 - BLOCKED
 
 Actionability is not the same as confidence.
+
+> Amended by ADR-013: actionability is assessed by the Input Evaluation stage
+> after compilation and travels in `InputEvaluation` / `UnderstandResult`.
 
 ## 5.9 LLM boundary
 

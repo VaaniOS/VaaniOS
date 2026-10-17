@@ -18,6 +18,7 @@ Primary owner:
 - ambiguity
 - temporal parsing
 - semantic evaluation
+- input evaluation (ADR-013) and the `UnderstandResult` handoff
 
 Core question:
 

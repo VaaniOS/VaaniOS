@@ -156,6 +156,10 @@ Fields:
 - actionability
 - created_at
 
+> Amended by ADR-013 / ADR-015: SemanticState 2.0 carries typed slots and no
+> `actionability`; see `vaaniflow.domain.schemas.semantic` and
+> `vaaniflow.domain.schemas.understand`.
+
 ## 3.6 Provenance
 
 Every important resolved fact should identify:

@@ -98,3 +98,54 @@ Represent old and new values with supersession.
 
 Reason:
 Auditability and correct semantic state.
+
+## ADR-013 — Input Evaluation stage and UnderstandResult handoff
+
+Decision:
+Actionability is assessed by a dedicated deterministic Input Evaluation stage (`vaaniflow.semantic.evaluation.InputEvaluator`) that runs after the semantic compiler. `SemanticState` no longer carries `actionability`; it travels in `InputEvaluation` together with structured reasons (code, effect, slot, evidence). The UNDERSTAND side hands off a single `UnderstandResult` (transcript + audio provenance + SemanticState + InputEvaluation) to the ACT side.
+
+Definitions:
+- COMPLETE — every required slot is stated and coherent.
+- PARTIAL — understood, but a reference ("same rate", "that order", "it") must be resolved by context.
+- CLARIFICATION_REQUIRED — the user must supply or disambiguate something.
+- BLOCKED — not an actionable request (or the audio is unusable).
+
+Reason:
+05 §5.8 lists actionability as a compiler responsibility, but the agreed team split makes Input Evaluation an UNDERSTAND deliverable with its own evidence. Separating "extract" from "assess" keeps the compiler free of policy-like judgement and gives ACT machine-readable reasons. This is semantic completeness only; it never consults business data and does not replace validation/policy (08).
+
+## ADR-014 — Orientation of bidirectional Hindi day words
+
+Decision:
+"kal" (±1), "parso" (±2) and "narso" (±3) are oriented by deterministic linguistic evidence in the compiler: (1) a temporal expression that qualifies a historical reference ("rate wahi jo parso bataya tha", "same rate as parso") is PAST; (2) otherwise the nearest tense cue in the same sub-clause decides ("bataya tha" → PAST, "dispatch karo" → FUTURE); (3) a correction inherits the corrected expression's direction. Without evidence the expression stays AMBIGUOUS and produces a TEMPORAL_AMBIGUITY. The evidence is stored in `direction_evidence`.
+
+The compiler emits only a signed day offset; turning it into a calendar date (run clock, business timezone, calendar) remains the context layer's job (06 §6.5, CLAUDE.md §11). `TemporalExpression.resolved_datetime` was removed from the semantic contract.
+
+Reason:
+The canonical scenario needs "parso" to mean two days ago without letting an LLM or the compiler invent dates. Tense is linguistic information that only the semantic layer sees.
+
+## ADR-015 — SemanticState 2.0 typed slots
+
+Decision:
+`SemanticState` (schema_version "2.0") replaces the flat `entities` / `quantities` / `constraints` lists with typed slots:
+`customer`, `addressee`, `items[]` (product mention bound to its quantity), `pricing[]` (spoken amount and/or historical reference, currency, per-unit, item binding), `tax` (spoken tax instruction), slot-targeted `references[]` (linked to items and temporal anchors), structured `temporal_expressions[]`, typed `corrections[]` with superseded and corrected values, `ambiguities[]` using the 05 §5.7 classes, `requested_actions[]` with recipient/channel, `run_id`, character spans and compiler provenance.
+
+Business-context ambiguity types (ambiguous customer record, ambiguous quote) are not part of the semantic ambiguity enum; they belong to `context.models.resolution.ResolutionStatus.AMBIGUOUS`. Missing information is an Input Evaluation reason, not an ambiguity.
+
+Reason:
+Flat lists forced the ACT side to guess which quantity belonged to which product and which "same rate" applied to what. Confidence remains per object (rule-tier, ordinal; see `semantic/confidence.py`).
+
+## ADR-016 — Write-once artifact storage and processed-artifact lineage
+
+Decision:
+`ArtifactStorage.store` is write-once (`ArtifactAlreadyExistsError`). Processed artifacts are stored at `local://processed/<artifact_id>.wav` and `AudioPreprocessingResult` records `source_artifact_id` and `applied_operations`. Processed-artifact quality metadata is measured (`vaaniflow.audio.quality`), not copied from the caller.
+
+Reason:
+Enforces ADR-011 (never overwrite original audio) and 04 §4.3 (original and processed artifacts preserved separately with metadata).
+
+## ADR-017 — Gnani speech-to-text adapter
+
+Decision:
+The ASR adapter uses the installed `gnani-vachana` SDK (`gnani.stt.GnaniSTTClient.transcribe_bytes`). It sends a filename hint derived from the artifact MIME type, maps SDK/network/configuration errors to typed `ASRProvider*Error`s, rejects `success: false`, keeps documented response metadata as opaque `Transcript.provider_metadata`, and leaves `detected_languages` empty because the REST response reports no language detection.
+
+Assumption (unverified without credentials):
+This SDK is the product referred to as "Prisma" in CLAUDE.md/20. Default `format="verbatim"` returns spoken-form numbers, which the compiler parses for romanised Hindi/English; Devanagari output is not yet supported by the compiler.
