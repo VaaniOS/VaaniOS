@@ -422,6 +422,11 @@ class SemanticState(DomainSchema):
     ambiguities: list[Ambiguity] = Field(default_factory=list)
     requested_actions: list[RequestedAction] = Field(default_factory=list)
 
+    # Actions the user explicitly told NOT to perform ("don't dispatch",
+    # "dispatch mat karo"). They are never requested actions and must never
+    # be executed; Input Evaluation makes the request non-actionable (ADR-018).
+    negated_actions: list[RequestedAction] = Field(default_factory=list)
+
     urgency: Urgency = Urgency.NORMAL
 
     created_at: datetime

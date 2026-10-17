@@ -92,6 +92,7 @@ class InputEvaluator:
 
         reasons += self._audio(audio)
         reasons += self._intent(state, transcript)
+        reasons += self._negations(state)
 
         if state.intent is not IntentType.UNKNOWN:
             reasons += self._required_slots(state)
@@ -148,6 +149,22 @@ class InputEvaluator:
         return []
 
     @staticmethod
+    def _negations(state: SemanticState) -> list[EvaluationReason]:
+        """An explicit "don't <action>" never becomes an executable request."""
+        return [
+            _reason(
+                EvaluationReasonCode.NEGATED_ACTION,
+                Q,
+                f"The user explicitly said not to perform {action.action_type.value} "
+                f"('{action.surface_text}'); this is not an executable request.",
+                slot=SemanticSlot.ACTION,
+                evidence=[action.surface_text],
+                related_ids=[action.action_id],
+            )
+            for action in state.negated_actions
+        ]
+
+    @staticmethod
     def _has_facts(state: SemanticState) -> bool:
         return bool(state.customer or state.items or state.pricing or state.references)
 
@@ -166,6 +183,8 @@ class InputEvaluator:
             ]
         if state.intent is not IntentType.UNKNOWN:
             return []
+        if state.negated_actions and self._has_facts(state):
+            return []  # explained by NEGATED_ACTION; nothing positive was asked
         if self._has_facts(state):
             evidence = [state.customer.surface_text] if state.customer else []
             evidence += [
@@ -223,7 +242,15 @@ class InputEvaluator:
             )
 
         if intent in _LINE_ITEM_INTENTS or intent is IntentType.CREATE_INVOICE:
-            if not state.items and not contextual_items and not product_reference:
+            offered_items = any(
+                a.slot in (SemanticSlot.PRODUCT, SemanticSlot.QUANTITY) for a in state.ambiguities
+            )
+            if (
+                not state.items
+                and not contextual_items
+                and not product_reference
+                and not offered_items
+            ):
                 reasons.append(
                     _reason(
                         EvaluationReasonCode.MISSING_ITEMS,
@@ -272,9 +299,15 @@ class InputEvaluator:
 
     def _item_reasons(self, state: SemanticState, item: SemanticItem) -> list[EvaluationReason]:
         reasons: list[EvaluationReason] = []
-        conflicted = any(item.item_id in a.related_ids for a in state.ambiguities)
+        related = [a for a in state.ambiguities if item.item_id in a.related_ids]
+        conflicted = any(a.slot is SemanticSlot.QUANTITY for a in related)
+        product_offered = any(a.slot is SemanticSlot.PRODUCT for a in related)
 
-        if item.product is None and not self._product_referenced(state, item):
+        if (
+            item.product is None
+            and not product_offered
+            and not self._product_referenced(state, item)
+        ):
             reasons.append(
                 _reason(
                     EvaluationReasonCode.MISSING_PRODUCT,

@@ -24,7 +24,7 @@ class TokenKind(StrEnum):
 _TOKEN_PATTERN = re.compile(
     r"\b(?i:rs|pvt|ltd)\.(?!\w)"  # abbreviations whose dot is not punctuation
     r"|(?P<number>\d+(?:,\d+)*(?:\.\d+)?)"
-    r"|(?P<word>[^\W\d_]+(?:'[^\W\d_]+)?)"
+    r"|(?P<word>[^\W\d_]+(?:['’][^\W\d_]+)?)"
     r"|/-|₹|[^\w\s]"
 )
 
@@ -60,7 +60,11 @@ def tokenize(text: str) -> list[Token]:
         else:
             kind = TokenKind.PUNCT
 
-        lower = raw.casefold().rstrip(".") if kind is TokenKind.WORD else raw.casefold()
+        lower = (
+            raw.casefold().rstrip(".").replace("’", "'")
+            if kind is TokenKind.WORD
+            else raw.casefold()
+        )
 
         tokens.append(
             Token(
@@ -143,11 +147,3 @@ def char_span(tokens: Sequence[Token], start: int, end: int) -> tuple[int, int]:
 def surface(text: str, tokens: Sequence[Token], start: int, end: int) -> str:
     char_start, char_end = char_span(tokens, start, end)
     return text[char_start:char_end]
-
-
-def next_non_punct(tokens: Sequence[Token], index: int, *, limit: int) -> int | None:
-    """Index of the first non-punctuation token at or after ``index``."""
-    for position in range(index, min(len(tokens), index + limit)):
-        if not tokens[position].is_punct:
-            return position
-    return None

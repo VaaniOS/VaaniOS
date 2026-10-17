@@ -31,7 +31,10 @@ It is NOT merely a JSON extractor.
 
 ## 5.3 Intermediate representation
 
-Recommended top-level structure:
+Original v1 sketch, kept for history. **It is not the current contract**:
+the implemented SemanticState 2.0 is defined by ADR-015 / ADR-018 and
+`vaaniflow.domain.schemas.semantic`, and actionability moved to Input
+Evaluation (ADR-013).
 
 ```json
 {
@@ -51,7 +54,8 @@ Recommended top-level structure:
 ```
 
 > Implemented as SemanticState 2.0 — see ADR-015 for the typed slot layout
-> (`items`, `pricing`, `tax`, slot-targeted `references`).
+> (`items`, `pricing`, `tax`, slot-targeted `references`) and ADR-018 for
+> `negated_actions` and offered alternatives.
 
 ## 5.4 Confidence must be contextual
 

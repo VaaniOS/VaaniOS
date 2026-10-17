@@ -67,6 +67,17 @@ def test_json_payload_exposes_the_handoff_fields() -> None:
     assert payload["semantic_state"]["schema_version"] == "2.0"
     assert payload["evaluation"]["actionability"] == "PARTIAL"
     assert payload["transcript"]["text"] == CANONICAL
+    assert payload["semantic_state"]["negated_actions"] == []
+
+
+def test_negated_actions_reach_act_separately_from_requested_actions() -> None:
+    payload = json.loads(
+        _result("Don't dispatch 200 bags of UltraTech cement to Sharma Builders.").model_dump_json()
+    )
+
+    assert payload["semantic_state"]["requested_actions"] == []
+    assert [a["action_type"] for a in payload["semantic_state"]["negated_actions"]] == ["DISPATCH"]
+    assert payload["evaluation"]["actionability"] == "CLARIFICATION_REQUIRED"
 
 
 def test_result_rejects_state_from_another_transcript() -> None:

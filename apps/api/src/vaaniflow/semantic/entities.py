@@ -13,6 +13,7 @@ from collections.abc import Sequence
 from vaaniflow.semantic import confidence as conf
 from vaaniflow.semantic.lexicon import (
     BUSINESS_SUFFIXES,
+    DISJUNCTIONS,
     INTERJECTIONS,
     NAME_STOPWORDS,
     PRODUCT_HEADS,
@@ -59,6 +60,82 @@ def _mention(
     )
 
 
+def _run_before(tokens: Sequence[Token], end: int, reserved: set[int], limit: int) -> int:
+    """Start of the name-eligible run ending at ``end`` (== end if empty)."""
+    start = end
+    while (
+        start > 0
+        and end - start < limit
+        and _name_eligible(tokens[start - 1], reserved)
+        and tokens[start - 1].lower not in BUSINESS_SUFFIXES
+    ):
+        start -= 1
+    return start
+
+
+def _run_after(tokens: Sequence[Token], begin: int, reserved: set[int], limit: int) -> int:
+    """End of the name-eligible run starting at ``begin`` (== begin if empty)."""
+    end = begin
+    while (
+        end < len(tokens)
+        and end - begin < limit
+        and _name_eligible(tokens[end], reserved)
+        and tokens[end].lower not in BUSINESS_SUFFIXES
+    ):
+        end += 1
+    return end
+
+
+def _is_disjunction(tokens: Sequence[Token], index: int) -> bool:
+    return 0 <= index < len(tokens) and tokens[index].lower in DISJUNCTIONS
+
+
+def _with_alternatives(
+    text: str,
+    tokens: Sequence[Token],
+    mention: Mention,
+    start: int,
+    end: int,
+    alternatives: list[str],
+) -> Mention:
+    """Widen a mention to cover offered alternatives; no single value is chosen."""
+    char_start, char_end = char_span(tokens, start, end)
+    mention.start, mention.end = start, end
+    mention.char_start, mention.char_end = char_start, char_end
+    mention.surface = text[char_start:char_end]
+    mention.alternatives = alternatives
+    mention.normalized = " | ".join(alternative.casefold() for alternative in alternatives)
+    return mention
+
+
+def merge_adjacent_alternatives(
+    text: str,
+    tokens: Sequence[Token],
+    mentions: list[Mention],
+) -> list[Mention]:
+    """Join "<A> ya <B>" where A and B are both full mentions of one kind."""
+    merged: list[Mention] = []
+    for mention in sorted(mentions, key=lambda m: m.start):
+        previous = merged[-1] if merged else None
+        if (
+            previous is not None
+            and previous.kind is mention.kind
+            and mention.start == previous.end + 1
+            and _is_disjunction(tokens, previous.end)
+            and tokens[previous.start].sentence == tokens[mention.start].sentence
+        ):
+            alternatives = [
+                *(previous.alternatives or [previous.surface]),
+                *(mention.alternatives or [mention.surface]),
+            ]
+            merged[-1] = _with_alternatives(
+                text, tokens, previous, previous.start, mention.end, alternatives
+            )
+            continue
+        merged.append(mention)
+    return merged
+
+
 # --------------------------------------------------------------------------- #
 # Products
 # --------------------------------------------------------------------------- #
@@ -95,13 +172,29 @@ def extract_product_mentions(
         ):
             start -= 1
 
-        mentions.append(
-            _mention(MentionKind.PRODUCT, text, tokens, start, end, conf.PRODUCT_WITH_CATEGORY_NOUN)
+        mention = _mention(
+            MentionKind.PRODUCT, text, tokens, start, end, conf.PRODUCT_WITH_CATEGORY_NOUN
         )
-        reserved.update(range(start, end))
+
+        # "UltraTech ya ACC cement": brand alternatives sharing one category noun.
+        head = text[tokens[index].start : tokens[end - 1].end]
+        alternatives = [mention.surface]
+        left = start
+        while _is_disjunction(tokens, left - 1):
+            run_start = _run_before(tokens, left - 1, reserved, _MAX_PRODUCT_MODIFIERS)
+            if run_start == left - 1:
+                break
+            brands = text[tokens[run_start].start : tokens[left - 2].end]
+            alternatives.insert(0, f"{brands} {head}")
+            left = run_start
+        if len(alternatives) > 1:
+            mention = _with_alternatives(text, tokens, mention, left, end, alternatives)
+
+        mentions.append(mention)
+        reserved.update(range(mention.start, mention.end))
         index = end
 
-    return mentions
+    return merge_adjacent_alternatives(text, tokens, mentions)
 
 
 def extract_positional_products(
@@ -136,14 +229,27 @@ def extract_positional_products(
 
         if end == start:
             continue
+
+        # "200 bags Birla ya JK dispatch karo": positional alternatives.
+        alternatives = [surface(text, tokens, start, end)]
+        while _is_disjunction(tokens, end):
+            run_end = _run_after(tokens, end + 1, reserved, _MAX_PRODUCT_MODIFIERS)
+            if run_end == end + 1:
+                break
+            alternatives.append(surface(text, tokens, end + 1, run_end))
+            end = run_end
+
         if end < len(tokens) and tokens[end].lower in {"ko", "ke"}:
             continue
         if end < len(tokens) and _name_eligible(tokens[end], reserved):
             continue  # run too long to be a confident product phrase
 
-        mentions.append(
-            _mention(MentionKind.PRODUCT, text, tokens, start, end, conf.PRODUCT_POSITIONAL_ONLY)
+        mention = _mention(
+            MentionKind.PRODUCT, text, tokens, start, end, conf.PRODUCT_POSITIONAL_ONLY
         )
+        if len(alternatives) > 1:
+            mention = _with_alternatives(text, tokens, mention, start, end, alternatives)
+        mentions.append(mention)
         reserved.update(range(start, end))
 
     return mentions
@@ -206,8 +312,28 @@ def extract_customer_mentions(
         # the guess pass as confident.
         if start == 1 and tokens[0].lower in INTERJECTIONS and len(name_tokens) > 1:
             score = conf.CUSTOMER_ADDRESSEE_OVERLAP
-        mentions.append(_mention(MentionKind.CUSTOMER, text, tokens, start, end, score))
-        reserved.update(range(start, end))
+        mention = _mention(MentionKind.CUSTOMER, text, tokens, start, end, score)
+
+        # "Sharma Builders ya Kumar Constructions ko" / "to Sharma or Kumar".
+        alternatives = [mention.surface]
+        left, right = start, end
+        while _is_disjunction(tokens, left - 1):
+            run_start = _backward_name(tokens, left - 1, reserved)
+            if run_start is None:
+                break
+            alternatives.insert(0, surface(text, tokens, run_start, left - 1))
+            left = run_start
+        while _is_disjunction(tokens, right):
+            run_end = _forward_name(tokens, right + 1, reserved)
+            if run_end is None:
+                break
+            alternatives.append(surface(text, tokens, right + 1, run_end))
+            right = run_end
+        if len(alternatives) > 1:
+            mention = _with_alternatives(text, tokens, mention, left, right, alternatives)
+
+        mentions.append(mention)
+        reserved.update(range(mention.start, mention.end))
 
     for token in tokens:
         position = token.index

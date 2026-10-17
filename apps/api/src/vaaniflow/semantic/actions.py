@@ -62,6 +62,14 @@ _QUESTION_WORDS = frozenset(
 )
 _PRICE_SETTING_WORDS = frozenset({"lagana", "lagao", "laga", "apply", "use", "at"})
 
+# Negators bound to an action cue (never a global flag):
+#   English: "don't dispatch", "do not dispatch", "never dispatch"
+#   Hinglish: "dispatch mat karo", "dispatch nahi karna", "mat bhejo"
+_ENGLISH_NEGATORS = frozenset({"don't", "dont", "never", "not"})
+_HINDI_NEGATORS = frozenset({"mat", "nahi", "nahin"})
+_HINDI_NEGATION_WINDOW_AFTER = 3
+_HINDI_NEGATION_WINDOW_BEFORE = 2
+
 _INTENT_PRIORITY: tuple[tuple[RequestedActionType, IntentType], ...] = (
     (RequestedActionType.CANCEL_ORDER, IntentType.CANCEL_ORDER),
     (RequestedActionType.UPDATE_ORDER, IntentType.UPDATE_ORDER),
@@ -95,6 +103,55 @@ def _first(sentence: Sequence[Token], words: frozenset[str]) -> Token | None:
     return next((token for token in sentence if token.lower in words), None)
 
 
+def _sub_clause(tokens: Sequence[Token], index: int, step: int, limit: int) -> list[Token]:
+    """Up to ``limit`` tokens from ``index`` in direction ``step``, stopping at punctuation."""
+    found: list[Token] = []
+    position = index + step
+    while 0 <= position < len(tokens) and len(found) < limit:
+        if tokens[position].is_punct:
+            break
+        found.append(tokens[position])
+        position += step
+    return found
+
+
+def negator_for(
+    tokens: Sequence[Token],
+    cue: Token,
+    correction_tokens: set[int],
+) -> Token | None:
+    """
+    The negation word that negates this action cue, if any.
+
+    English negators must directly precede the cue ("don't dispatch",
+    "do not dispatch", "never dispatch"). Hindi negators may sit right after
+    the verb ("dispatch mat karo", "dispatch nahi karna") or right before it
+    ("mat bhejo"). The search never crosses punctuation, so correction
+    markers such as "..., nahi nahi, ..." and "not tomorrow" elsewhere in
+    the utterance are not mistaken for negation of the action.
+    """
+    before = _sub_clause(tokens, cue.index, -1, _HINDI_NEGATION_WINDOW_BEFORE)
+    after = _sub_clause(tokens, cue.index, 1, _HINDI_NEGATION_WINDOW_AFTER)
+
+    if before and before[0].lower in _ENGLISH_NEGATORS and before[0].index not in correction_tokens:
+        # Include the auxiliary in "do not dispatch" so the span reads naturally.
+        if before[0].lower == "not" and len(before) > 1 and before[1].lower in {"do", "does"}:
+            return before[1]
+        return before[0]
+
+    for token in (*after, *before):
+        if token.lower in _HINDI_NEGATORS and token.index not in correction_tokens:
+            return token
+
+    return None
+
+
+@dataclass(frozen=True, slots=True)
+class ExtractedActions:
+    requested: list[RequestedAction]
+    negated: list[RequestedAction]
+
+
 def extract_requested_actions(
     text: str,
     tokens: Sequence[Token],
@@ -102,13 +159,17 @@ def extract_requested_actions(
     goods_tokens: set[int],
     customer_tokens: set[int],
     correction_tokens: set[int],
-) -> list[RequestedAction]:
+) -> ExtractedActions:
     """
     goods_tokens: token indexes of product/quantity mentions.
     customer_tokens: token indexes of customer mentions.
     correction_tokens: token indexes of correction markers ("change that to").
+
+    Negated cues ("don't dispatch", "dispatch mat karo") are returned in
+    ``negated`` and never as requested actions.
     """
     actions: dict[RequestedActionType, RequestedAction] = {}
+    negated: dict[RequestedActionType, RequestedAction] = {}
 
     def add(
         action_type: RequestedActionType,
@@ -118,17 +179,22 @@ def extract_requested_actions(
         recipient: ActionParty | None = None,
         channel: str | None = None,
     ) -> None:
-        existing = actions.get(action_type)
+        negator = negator_for(tokens, cue, correction_tokens)
+        target = negated if negator is not None else actions
+        start = min(cue.start, negator.start) if negator else cue.start
+        end = max(cue.end, negator.end) if negator else cue.end
+
+        existing = target.get(action_type)
         if existing is not None and existing.confidence.score >= score:
             return
-        actions[action_type] = RequestedAction(
+        target[action_type] = RequestedAction(
             action_id=uuid4(),
             action_type=action_type,
             explicit=True,
             recipient=recipient,
             channel=channel,
-            surface_text=text[cue.start : cue.end],
-            span=TextSpan(start=cue.start, end=cue.end),
+            surface_text=text[start:end],
+            span=TextSpan(start=start, end=end),
             confidence=conf.rule(score),
         )
 
@@ -203,7 +269,10 @@ def extract_requested_actions(
         if price_cue is not None and words & _QUESTION_WORDS and not words & _PRICE_SETTING_WORDS:
             add(RequestedActionType.CHECK_PRICE, price_cue, conf.ACTION_EXPLICIT)
 
-    return sorted(actions.values(), key=lambda action: action.span.start)
+    def ordered(values: dict[RequestedActionType, RequestedAction]) -> list[RequestedAction]:
+        return sorted(values.values(), key=lambda action: action.span.start)
+
+    return ExtractedActions(requested=ordered(actions), negated=ordered(negated))
 
 
 def decide_intent(actions: Sequence[RequestedAction]) -> IntentDecision:

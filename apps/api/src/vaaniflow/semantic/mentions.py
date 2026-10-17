@@ -34,11 +34,10 @@ class Mention:
     currency: str | None = None
     per_unit: str | None = None
     temporal: TemporalExpression | None = None
+    # Set when the user offered alternatives ("UltraTech ya ACC cement",
+    # "200 ya 300 bags"): the candidates, and no single resolved value.
+    alternatives: list[str] = field(default_factory=list)
     mention_id: UUID = field(default_factory=uuid4)
-
-    @property
-    def is_numeric(self) -> bool:
-        return self.kind in (MentionKind.QUANTITY, MentionKind.BARE_NUMBER, MentionKind.PRICE)
 
     def tokens(self) -> range:
         return range(self.start, self.end)

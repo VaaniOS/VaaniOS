@@ -149,3 +149,14 @@ The ASR adapter uses the installed `gnani-vachana` SDK (`gnani.stt.GnaniSTTClien
 
 Assumption (unverified without credentials):
 This SDK is the product referred to as "Prisma" in CLAUDE.md/20. Default `format="verbatim"` returns spoken-form numbers, which the compiler parses for romanised Hindi/English; Devanagari output is not yet supported by the compiler.
+
+## ADR-018 — Negated actions and offered alternatives
+
+Decision:
+1. Negation is bound to an action cue inside its sub-clause (never a global flag): English "don't / do not / never <verb>", Hinglish "<verb> mat/nahi/nahin …" or "mat/nahi <verb>". A negated cue is recorded in `SemanticState.negated_actions`, never in `requested_actions`, and Input Evaluation adds a `NEGATED_ACTION` reason (CLARIFICATION_REQUIRED; BLOCKED when nothing else was said). An action both requested and negated is an ACTION_AMBIGUITY. Correction markers (", nahi nahi,", "not tomorrow") are separated by punctuation and are not treated as negation.
+2. Alternatives introduced by "ya" / "or" ("UltraTech ya ACC cement", "200 ya 300 bags", "Sharma ya Kumar ko", "400 ya 420 rupaye") are never resolved to one value. The slot stays empty and an ENTITY_AMBIGUITY (product/customer) or VALUE_AMBIGUITY (quantity/price) lists every candidate.
+
+`negated_actions` was added to SemanticState 2.0 before the contract was first published, so `schema_version` stays "2.0".
+
+Reason:
+"don't dispatch" ≠ dispatch, "UltraTech ya ACC" ≠ one product, "200 ya 300" ≠ 300. The semantic layer must surface these explicitly instead of producing a confident COMPLETE state.

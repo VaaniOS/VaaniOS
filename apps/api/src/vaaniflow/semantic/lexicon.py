@@ -125,6 +125,8 @@ NAME_STOPWORDS = frozenset(
         "arre", "arey", "hey", "oye", "suno", "haan", "ok", "okay", "achha", "bhai",
         "ji", "sir", "hello", "hi", "namaste", "namaskar", "good", "morning", "thanks",
         "thank", "dear", "yes", "you",
+        # disjunctions
+        "ya", "or", "athva", "athwa", "either",
         # correction markers
         "actually", "sorry", "no", "nahi", "nahin", "matlab", "rather", "wait",
         # urgency
@@ -134,6 +136,9 @@ NAME_STOPWORDS = frozenset(
         "what", "how", "kya", "kitna", "kitne", "much", "many", "everything", "all", "sab",
     }
 )  # fmt: skip
+
+# Disjunctions that introduce alternatives ("UltraTech ya ACC", "200 or 300").
+DISJUNCTIONS = frozenset({"ya", "or", "athva", "athwa"})
 
 INTERJECTIONS = frozenset({"arre", "are", "arey", "hey", "oye", "suno", "haan", "ok", "okay"})
 

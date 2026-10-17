@@ -62,6 +62,7 @@ from vaaniflow.semantic.quantities import (
     extract_price_mentions,
     extract_quantity_mentions,
     extract_tax,
+    merge_numeric_alternatives,
 )
 from vaaniflow.semantic.references import extract_reference_matches
 from vaaniflow.semantic.temporal import anchor_to_reference, extract_temporal_mentions
@@ -149,6 +150,9 @@ class SemanticCompiler:
         prices = extract_price_mentions(text, tokens, reserved)
         products = extract_product_mentions(text, tokens, reserved)
         quantities = extract_quantity_mentions(text, tokens, reserved)
+        numeric_mentions = merge_numeric_alternatives(text, tokens, [*prices, *quantities])
+        prices = [m for m in numeric_mentions if m.kind is MentionKind.PRICE]
+        quantities = [m for m in numeric_mentions if m.kind is not MentionKind.PRICE]
         products += extract_positional_products(text, tokens, reserved, quantities)
 
         reference_matches = extract_reference_matches(text, tokens)
@@ -174,7 +178,10 @@ class SemanticCompiler:
         live_customers = alive(customers, MentionKind.CUSTOMER)
         distinct_customers = {m.normalized: m for m in live_customers}
         customer: SemanticEntity | None = None
-        if len(distinct_customers) == 1:
+        offered = [m for m in live_customers if m.alternatives]
+        if offered:
+            ambiguities.append(amb.customer_alternatives(offered[0].alternatives))
+        elif len(distinct_customers) == 1:
             customer = _entity(next(iter(distinct_customers.values())), SemanticEntityType.CUSTOMER)
         elif len(distinct_customers) > 1:
             ambiguities.append(amb.competing_customers([m.surface for m in live_customers]))
@@ -186,6 +193,16 @@ class SemanticCompiler:
             [m for m in products if m.kind is MentionKind.PRODUCT],
             replacements,
         )
+        # Goods context for "send/bhej" is taken before alternatives are
+        # withheld, so "send UltraTech or ACC cement" is still a dispatch.
+        goods_tokens = {
+            i
+            for draft in drafts
+            for m in (draft.product, draft.quantity)
+            if m is not None
+            for i in m.tokens()
+        }
+        drafts = self._withhold_alternatives(drafts, ambiguities)
         items = [self._item(draft) for draft in drafts]
         for draft in drafts:
             if draft.conflicting_quantities and draft.product is not None:
@@ -227,13 +244,6 @@ class SemanticCompiler:
         marker_tokens = {
             i for record in records for i in range(record.marker.start, record.marker.end)
         }
-        goods_tokens = {
-            i
-            for draft in drafts
-            for m in (draft.product, draft.quantity)
-            if m is not None
-            for i in m.tokens()
-        }
         # "send it" / "usko bhejo": the pronoun object stands for the goods.
         goods_tokens.update(
             i
@@ -241,16 +251,22 @@ class SemanticCompiler:
             if reference.reference_type in (ReferenceType.PRONOUN, ReferenceType.PRODUCT)
             for i in range(start, end)
         )
-        actions = extract_requested_actions(
+        extracted = extract_requested_actions(
             text,
             tokens,
             goods_tokens=goods_tokens,
             customer_tokens={i for m in live_customers for i in m.tokens()},
             correction_tokens=marker_tokens,
         )
+        actions = extracted.requested
         decision = decide_intent(actions)
         if decision.conflicting:
             ambiguities.append(amb.competing_actions(decision.conflicting))
+        contradicted = sorted(
+            {a.action_type for a in actions} & {a.action_type for a in extracted.negated}
+        )
+        if contradicted:
+            ambiguities.append(amb.requested_and_negated(contradicted))
 
         temporal_expressions = self._target_temporal(
             tokens, temporal_mentions, temporal_by_id, actions
@@ -258,9 +274,15 @@ class SemanticCompiler:
         ambiguities.extend(amb.temporal_ambiguities(temporal_expressions))
 
         # Pricing ------------------------------------------------------------ #
+        live_prices = [
+            m for m in numeric if m.kind is MentionKind.PRICE and m.mention_id not in superseded
+        ]
+        for mention in live_prices:
+            if mention.alternatives:
+                ambiguities.append(amb.price_alternatives(mention.alternatives))
         pricing, price_ambiguities, price_ids = self._pricing(
             tokens,
-            [m for m in numeric if m.kind is MentionKind.PRICE and m.mention_id not in superseded],
+            [m for m in live_prices if not m.alternatives],
             references,
             reference_matches,
             drafts,
@@ -288,11 +310,41 @@ class SemanticCompiler:
             corrections=corrections,
             ambiguities=ambiguities,
             requested_actions=actions,
+            negated_actions=extracted.negated,
             urgency=extract_urgency(tokens),
             created_at=self._clock(),
         )
 
     # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _withhold_alternatives(
+        drafts: list[ItemDraft],
+        ambiguities: list[Ambiguity],
+    ) -> list[ItemDraft]:
+        """
+        "UltraTech ya ACC cement" / "200 ya 300 bags": the offered
+        alternatives become an ambiguity and the slot stays empty, so no
+        single product or quantity is silently chosen. An item left with
+        neither product nor quantity is dropped (the ambiguity remains).
+        """
+        kept: list[ItemDraft] = []
+        for draft in drafts:
+            product_options = draft.product.alternatives if draft.product else []
+            quantity_options = draft.quantity.alternatives if draft.quantity else []
+            if product_options:
+                draft.product = None
+            if quantity_options:
+                draft.quantity = None
+            keep = draft.product is not None or draft.quantity is not None
+            related = [draft.item_id] if keep else []
+            if product_options:
+                ambiguities.append(amb.product_alternatives(product_options, related))
+            if quantity_options:
+                ambiguities.append(amb.quantity_alternatives(quantity_options, related))
+            if keep:
+                kept.append(draft)
+        return kept
 
     @staticmethod
     def _item(draft: ItemDraft) -> SemanticItem:

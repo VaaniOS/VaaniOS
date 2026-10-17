@@ -74,6 +74,26 @@ def test_bidirectional_hindi_day_words_follow_tense(text: str, offset: int, evid
     assert expression.resolution_status is TemporalResolutionStatus.UNRESOLVED
 
 
+def test_narso_is_three_days_and_follows_tense() -> None:
+    future = _one("Narso dispatch karo.")
+    past = _one("Narso bataya tha.")
+
+    assert (future.surface_text, future.day_offset, future.normalized_expression) == (
+        "Narso",
+        3,
+        "DAY_OFFSET:+3",
+    )
+    assert future.direction is TemporalDirection.FUTURE
+    assert (past.day_offset, past.direction) == (-3, TemporalDirection.PAST)
+
+
+def test_narso_without_tense_is_ambiguous() -> None:
+    expression = _one("Narso.")
+
+    assert expression.resolution_status is TemporalResolutionStatus.AMBIGUOUS
+    assert expression.normalized_expression == "DAY_OFFSET:±3"
+
+
 @pytest.mark.parametrize("text", ["Parso.", "Sharma Builders, kal."])
 def test_bidirectional_day_word_without_tense_is_ambiguous(text: str) -> None:
     expression = _one(text)

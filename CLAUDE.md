@@ -480,44 +480,23 @@ Output:
 - actionability
 - requested actions
 
-Example:
+Current contract (supersedes the earlier v1 example that stood here):
 
-{
-  "intent": "CREATE_DISPATCH_ORDER",
-  "customer_reference": "Sharma Builders",
-  "recipient_reference": "Suresh",
-  "items": [
-    {
-      "product_reference": "UltraTech cement",
-      "quantity": 200,
-      "unit": "bag"
-    }
-  ],
-  "pricing": {
-    "type": "HISTORICAL_REFERENCE",
-    "reference": "same rate as the day before yesterday",
-    "spoken_value": 420,
-    "unit": "bag"
-  },
-  "tax": {
-    "instruction": "plus GST"
-  },
-  "temporal_references": [
-    {
-      "expression": "parso",
-      "type": "RELATIVE_DATE"
-    }
-  ],
-  "requested_actions": [
-    "CREATE_INVOICE_DRAFT",
-    "REQUEST_OWNER_APPROVAL",
-    "PREPARE_DISPATCH"
-  ],
-  "urgency": "HIGH",
-  "ambiguities": [],
-  "corrections": [],
-  "actionability": "PARTIAL"
-}
+- `SemanticState` schema 2.0 — `apps/api/src/vaaniflow/domain/schemas/semantic.py`
+  (typed `customer`, `addressee`, product-bound `items`, structured `pricing`,
+  `tax`, slot-targeted `references`, `temporal_expressions`, `corrections`,
+  semantic `ambiguities`, `requested_actions`, `negated_actions`, spans,
+  compiler provenance). See ADR-015 and ADR-018.
+- Actionability is not part of SemanticState: it is produced by Input
+  Evaluation and handed to ACT inside `UnderstandResult`
+  (`apps/api/src/vaaniflow/domain/schemas/understand.py`, ADR-013).
+- The canonical Ramesh note compiles to CREATE_DISPATCH_ORDER, customer
+  "Sharma Builders", item 200 bag "Ultratech cement", price 420 INR/bag
+  linked to the "Rate wahi" reference, GST exclusive, "parso" = DAY_OFFSET:-2
+  (past), actions DISPATCH / CREATE_INVOICE_DRAFT / SEND_NOTIFICATION /
+  REQUEST_APPROVAL, urgency HIGH, actionability PARTIAL — see the golden test
+  `apps/api/tests/unit/semantic/test_compiler.py`.
+- Consumer guide: `docs/architecture/understand-handoff.md`.
 
 The schema must be typed and versioned.
 

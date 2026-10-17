@@ -91,6 +91,58 @@ def unscoped_price(price_surface: str, price_id: UUID, item_ids: Sequence[UUID])
     )
 
 
+def product_alternatives(candidates: Sequence[str], related_ids: Sequence[UUID]) -> Ambiguity:
+    return _ambiguity(
+        AmbiguityType.ENTITY_AMBIGUITY,
+        SemanticSlot.PRODUCT,
+        "Alternative products were offered ('ya' / 'or'); no single product was chosen.",
+        AmbiguitySeverity.HIGH,
+        candidates=candidates,
+        related_ids=related_ids,
+    )
+
+
+def customer_alternatives(candidates: Sequence[str]) -> Ambiguity:
+    return _ambiguity(
+        AmbiguityType.ENTITY_AMBIGUITY,
+        SemanticSlot.CUSTOMER,
+        "Alternative customers were offered ('ya' / 'or'); no single customer was chosen.",
+        AmbiguitySeverity.HIGH,
+        candidates=candidates,
+    )
+
+
+def quantity_alternatives(candidates: Sequence[str], related_ids: Sequence[UUID]) -> Ambiguity:
+    return _ambiguity(
+        AmbiguityType.VALUE_AMBIGUITY,
+        SemanticSlot.QUANTITY,
+        "Alternative quantities were offered ('ya' / 'or'); no single quantity was chosen.",
+        AmbiguitySeverity.HIGH,
+        candidates=candidates,
+        related_ids=related_ids,
+    )
+
+
+def price_alternatives(candidates: Sequence[str]) -> Ambiguity:
+    return _ambiguity(
+        AmbiguityType.VALUE_AMBIGUITY,
+        SemanticSlot.PRICE,
+        "Alternative prices were offered ('ya' / 'or'); no single price was chosen.",
+        AmbiguitySeverity.HIGH,
+        candidates=candidates,
+    )
+
+
+def requested_and_negated(actions: Sequence[RequestedActionType]) -> Ambiguity:
+    return _ambiguity(
+        AmbiguityType.ACTION_AMBIGUITY,
+        SemanticSlot.ACTION,
+        "The same action was both requested and explicitly negated.",
+        AmbiguitySeverity.HIGH,
+        candidates=[action.value for action in actions],
+    )
+
+
 def competing_actions(actions: Sequence[RequestedActionType]) -> Ambiguity:
     return _ambiguity(
         AmbiguityType.ACTION_AMBIGUITY,
