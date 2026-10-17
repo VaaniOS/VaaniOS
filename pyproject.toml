@@ -12,6 +12,8 @@ dependencies = [
     "pydantic>=2.10,<3.0",
     "pydantic-settings>=2.7,<3.0",
     "uvicorn[standard]>=0.34,<1.0",
+    "soundfile>=0.14,<0.15",
+    "scipy>=1.18,<1.19",
 ]
 
 [project.optional-dependencies]
@@ -38,3 +40,10 @@ src = ["apps/api/src", "apps/api/tests"]
 [tool.mypy]
 python_version = "3.12"
 mypy_path = ["apps/api/src"]
+
+[[tool.mypy.overrides]]
+module = [
+    "soundfile",
+    "scipy.signal",
+]
+ignore_missing_imports = true
