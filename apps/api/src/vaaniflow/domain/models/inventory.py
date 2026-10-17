@@ -27,8 +27,6 @@ class Inventory(DomainSchema):
     @model_validator(mode="after")
     def validate_quantities(self) -> "Inventory":
         if self.reserved_quantity > self.available_quantity:
-            raise ValueError(
-                "reserved_quantity cannot exceed available_quantity"
-            )
+            raise ValueError("reserved_quantity cannot exceed available_quantity")
 
         return self
