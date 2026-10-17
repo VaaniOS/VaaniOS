@@ -19,6 +19,10 @@ class ASRProviderInvalidInputError(ASRProviderError):
     """Raised when the provider rejects the supplied audio input."""
 
 
+class ASRProviderConfigurationError(ASRProviderError):
+    """Raised when the adapter is configured with values the provider rejects."""
+
+
 class ASRProvider(Protocol):
     """
     Port for speech-to-text providers.
