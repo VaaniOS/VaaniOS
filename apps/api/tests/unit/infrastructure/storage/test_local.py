@@ -6,6 +6,7 @@ from uuid import uuid4
 import pytest
 
 from vaaniflow.application.ports.artifact_storage import (
+    ArtifactAlreadyExistsError,
     ArtifactNotFoundError,
     ArtifactStorage,
     ArtifactStorageError,
@@ -83,9 +84,10 @@ def test_local_storage_creates_parent_directories(
     assert expected_path.read_bytes() == b"audio"
 
 
-def test_local_storage_overwrites_existing_artifact(
+def test_local_storage_refuses_to_overwrite_existing_artifact(
     tmp_path: Path,
 ) -> None:
+    """Artifacts are write-once: original audio evidence is never replaced."""
     storage = LocalArtifactStorage(tmp_path)
 
     artifact = make_audio_artifact()
@@ -95,13 +97,14 @@ def test_local_storage_overwrites_existing_artifact(
         data=BytesIO(b"first payload"),
     )
 
-    storage.store(
-        artifact=artifact,
-        data=BytesIO(b"second payload"),
-    )
+    with pytest.raises(ArtifactAlreadyExistsError):
+        storage.store(
+            artifact=artifact,
+            data=BytesIO(b"second payload"),
+        )
 
     with storage.open(storage_ref=artifact.storage_ref) as stored:
-        assert stored.read() == b"second payload"
+        assert stored.read() == b"first payload"
 
 
 def test_local_storage_raises_not_found_for_missing_artifact(
