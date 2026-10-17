@@ -48,16 +48,14 @@ class MockASR:
 
         audio.read()
 
-        language = request.language_hint
-
-        detected_languages = [language] if language is not None else []
-
+        # The mock performs no language identification: the hint is the
+        # transcript language, but nothing is reported as "detected".
         return Transcript(
             transcript_id=uuid4(),
             provider=self._provider,
             provider_request_id=None,
-            language=language,
-            detected_languages=detected_languages,
+            language=request.language_hint,
+            detected_languages=[],
             text=self._text,
             segments=[],
             created_at=datetime.now(UTC),

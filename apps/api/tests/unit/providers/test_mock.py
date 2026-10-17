@@ -65,7 +65,8 @@ def test_mock_asr_returns_deterministic_transcript() -> None:
     assert transcript.provider == "mock"
     assert transcript.text == "Send 200 bags of cement"
     assert transcript.language == "en-IN"
-    assert transcript.detected_languages == ["en-IN"]
+    # The mock performs no language identification.
+    assert transcript.detected_languages == []
     assert transcript.segments == []
 
 

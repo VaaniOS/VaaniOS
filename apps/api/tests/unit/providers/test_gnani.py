@@ -4,6 +4,7 @@ from uuid import uuid4
 import pytest
 
 from vaaniflow.application.ports.asr import (
+    ASRProviderConfigurationError,
     ASRProviderError,
     ASRProviderInvalidInputError,
     ASRProviderUnavailableError,
@@ -20,10 +21,10 @@ class FakeGnaniClient:
         self.error = error
         self.calls = []
 
-    def transcribe(self, audio, **kwargs):
+    def transcribe_bytes(self, audio_bytes, **kwargs):
         self.calls.append(
             {
-                "audio": audio,
+                "audio": audio_bytes,
                 "kwargs": kwargs,
             }
         )
@@ -80,14 +81,23 @@ def test_transcribe_maps_gnani_response_to_transcript():
     assert transcript.provider == "gnani"
     assert transcript.provider_request_id == "gnani-request-123"
     assert transcript.language == "en-IN"
-    assert transcript.detected_languages == ["en-IN"]
+    # Gnani does not report language detection; the hint is not "detected".
+    assert transcript.detected_languages == []
     assert transcript.text == "Send 200 bags of cement."
     assert transcript.segments == []
     assert transcript.transcript_id != request.artifact_id
+    assert transcript.provider_metadata == {
+        "format": "verbatim",
+        "requested_language": "en-IN",
+        "model": "prisma",
+        "processing_time": 0.42,
+        "end_to_end_latency": None,
+    }
 
     assert len(client.calls) == 1
-    assert client.calls[0]["audio"].read() == b"fake-audio"
+    assert client.calls[0]["audio"] == b"fake-audio"
     assert client.calls[0]["kwargs"] == {
+        "filename": "audio.wav",
         "language_code": "en-IN",
         "format": "verbatim",
         "itn_native_numerals": False,
@@ -112,7 +122,7 @@ def test_transcribe_uses_language_hint():
     )
 
     assert transcript.language == "kn-IN"
-    assert transcript.detected_languages == ["kn-IN"]
+    assert transcript.detected_languages == []
     assert transcript.text == "ನಮಸ್ಕಾರ"
 
     assert client.calls[0]["kwargs"]["language_code"] == "kn-IN"
@@ -139,6 +149,7 @@ def test_transcribe_can_enable_itn_format():
     )
 
     assert client.calls[0]["kwargs"] == {
+        "filename": "audio.wav",
         "language_code": "en-IN",
         "format": "transcribe",
         "itn_native_numerals": True,
@@ -269,3 +280,48 @@ def test_empty_format_is_rejected():
             client=client,
             format="",
         )
+
+
+def test_filename_hint_follows_artifact_mime_type():
+    client = FakeGnaniClient(response={"success": True, "transcript": "ok"})
+    request = _request()
+    request = request.model_copy(
+        update={"metadata": request.metadata.model_copy(update={"mime_type": "audio/ogg"})}
+    )
+
+    GnaniASRProvider(client=client).transcribe(request=request, audio=BytesIO(b"x"))
+
+    assert client.calls[0]["kwargs"]["filename"] == "audio.ogg"
+
+
+def test_unsuccessful_response_maps_to_provider_error():
+    client = FakeGnaniClient(response={"success": False, "transcript": "partial text"})
+
+    with pytest.raises(ASRProviderError, match="unsuccessful"):
+        GnaniASRProvider(client=client).transcribe(request=_request(), audio=BytesIO(b"x"))
+
+
+def test_sdk_configuration_error_maps_to_configuration_error():
+    client = FakeGnaniClient(error=ValueError("Unsupported language code 'xx-IN'"))
+
+    with pytest.raises(ASRProviderConfigurationError):
+        GnaniASRProvider(client=client).transcribe(
+            request=_request(language_hint="xx-IN"), audio=BytesIO(b"x")
+        )
+
+
+def test_network_error_maps_to_provider_unavailable():
+    client = FakeGnaniClient(error=ConnectionError("connection reset"))
+
+    with pytest.raises(ASRProviderUnavailableError, match="could not be reached"):
+        GnaniASRProvider(client=client).transcribe(request=_request(), audio=BytesIO(b"x"))
+
+
+def test_non_scalar_provider_metadata_is_dropped():
+    client = FakeGnaniClient(
+        response={"success": True, "transcript": "ok", "model": {"name": "nested"}}
+    )
+
+    transcript = GnaniASRProvider(client=client).transcribe(request=_request(), audio=BytesIO(b"x"))
+
+    assert "model" not in transcript.provider_metadata
