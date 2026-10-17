@@ -1,3 +1,4 @@
 from vaaniflow.semantic.compiler import SemanticCompiler
+from vaaniflow.semantic.evaluation import InputEvaluator
 
-__all__ = ["SemanticCompiler"]
+__all__ = ["InputEvaluator", "SemanticCompiler"]

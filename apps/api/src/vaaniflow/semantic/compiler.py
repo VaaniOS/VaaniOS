@@ -1,602 +1,523 @@
-import re
-from datetime import UTC, datetime
-from decimal import Decimal
-from uuid import uuid4
+"""
+Deterministic semantic compiler: Transcript → SemanticState.
 
-from vaaniflow.domain.schemas.common import (
-    Actionability,
-    Confidence,
-    ConfidenceSource,
-)
+Pipeline (each step is a small module in this package):
+
+    tokenize
+      → temporal expressions        (reserve tokens; "15 October" is not a quantity)
+      → addressee                   ("Arre Suresh, ...")
+      → prices, products, quantities, customers
+      → references, tax, corrections
+      → item binding, price binding, reference/temporal linking
+      → requested actions, intent, urgency
+      → semantic ambiguities
+      → SemanticState
+
+The compiler understands language only. It does not resolve business IDs,
+query business data, validate prices, check inventory, authorise or execute
+anything, and it does not judge actionability (Input Evaluation does).
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Iterable, Sequence
+from datetime import UTC, datetime
+from uuid import UUID, uuid4
+
 from vaaniflow.domain.schemas.semantic import (
-    IntentType,
-    Quantity,
+    Ambiguity,
+    CompilerProvenance,
+    CorrectionEvent,
+    CorrectionField,
+    CorrectionValue,
+    PriceSource,
+    ReferenceType,
     RequestedAction,
     RequestedActionType,
-    SemanticConstraint,
     SemanticEntity,
     SemanticEntityType,
+    SemanticItem,
+    SemanticPrice,
+    SemanticQuantity,
+    SemanticReference,
     SemanticState,
-    Urgency,
+    TemporalExpression,
+    TemporalTarget,
+    TextSpan,
 )
 from vaaniflow.domain.schemas.transcript import Transcript
-from vaaniflow.semantic.ambiguity import (
-    build_missing_field_ambiguities,
-    build_temporal_ambiguities,
+from vaaniflow.semantic import ambiguity as amb
+from vaaniflow.semantic import confidence as conf
+from vaaniflow.semantic.actions import decide_intent, extract_requested_actions, extract_urgency
+from vaaniflow.semantic.corrections import CorrectionRecord, detect_corrections
+from vaaniflow.semantic.entities import (
+    extract_addressee,
+    extract_customer_mentions,
+    extract_positional_products,
+    extract_product_mentions,
 )
-from vaaniflow.semantic.corrections import detect_quantity_corrections
-from vaaniflow.semantic.references import extract_references
-from vaaniflow.semantic.temporal import extract_temporal_expressions
-
-_QUANTITY_PATTERN = re.compile(
-    r"(?P<value>\d+(?:\.\d+)?)\s*"
-    r"(?P<unit>"
-    r"bags?|bag|"
-    r"kg|kgs|kilograms?|"
-    r"g|grams?|"
-    r"tons?|tonnes?|"
-    r"pieces?|pcs?|"
-    r"units?"
-    r")\b",
-    flags=re.IGNORECASE,
+from vaaniflow.semantic.items import ItemDraft, bind_items
+from vaaniflow.semantic.mentions import Mention, MentionKind
+from vaaniflow.semantic.quantities import (
+    extract_price_mentions,
+    extract_quantity_mentions,
+    extract_tax,
 )
+from vaaniflow.semantic.references import extract_reference_matches
+from vaaniflow.semantic.temporal import anchor_to_reference, extract_temporal_mentions
+from vaaniflow.semantic.text import Token, tokenize
 
+COMPILER_NAME = "vaaniflow.deterministic-compiler"
+COMPILER_VERSION = "2.0.0"
 
-_CUSTOMER_PATTERN = re.compile(
-    r"(?P<name>"
-    r"[A-Za-z][A-Za-z0-9&.'-]*(?:\s+[A-Za-z0-9&.'-]+){0,4}"
-    r")\s+"
-    r"(?:ko|to)\b",
-    flags=re.IGNORECASE,
+_HISTORICAL_PRICE_REFERENCES = frozenset(
+    {ReferenceType.HISTORICAL_PRICE, ReferenceType.HISTORICAL_QUOTE}
 )
-
-
-_PRODUCT_AFTER_QUANTITY_PATTERN = re.compile(
-    r"\b\d+(?:\.\d+)?\s+"
-    r"(?:bags?|kg|kgs|kilograms?|g|grams?|tons?|tonnes?|pieces?|pcs?|units?)"
-    r"\s+"
-    r"(?P<product>"
-    r"[A-Za-z][A-Za-z0-9&./-]*"
-    r"(?:\s+[A-Za-z0-9&./-]+){0,5}"
-    r")",
-    flags=re.IGNORECASE,
+_EXECUTION_ACTIONS = frozenset(
+    {
+        RequestedActionType.DISPATCH,
+        RequestedActionType.CREATE_ORDER,
+        RequestedActionType.UPDATE_ORDER,
+        RequestedActionType.CANCEL_ORDER,
+    }
 )
+_REFERENCE_TEMPORAL_WINDOW_AFTER = 6
+_REFERENCE_TEMPORAL_WINDOW_BEFORE = 3
 
 
-_PRODUCT_EXPLICIT_PATTERN = re.compile(
-    r"\b(?:product|item)\s+"
-    r"(?P<product>"
-    r"[A-Za-z][A-Za-z0-9&./-]*"
-    r"(?:\s+[A-Za-z0-9&./-]+){0,5}"
-    r")",
-    flags=re.IGNORECASE,
-)
+def _span(mention: Mention) -> TextSpan:
+    return TextSpan(start=mention.char_start, end=mention.char_end)
 
 
-_PRICE_CONTEXT_PATTERN = re.compile(
-    r"(?:rate|price|cost|at)\s+(?:of\s+)?"
-    r"(?:₹\s*|rs\.?\s*|rupees?\s*)?"
-    r"(?P<price>\d+(?:\.\d+)?)",
-    flags=re.IGNORECASE,
-)
-
-
-_URGENCY_HIGH = (
-    "urgent",
-    "urgently",
-    "immediately",
-    "asap",
-    "right away",
-    "turant",
-    "jaldi",
-)
-
-
-_URGENCY_CRITICAL = (
-    "critical",
-    "emergency",
-    "immediate emergency",
-)
-
-
-_PRODUCT_ACTION_STOPWORDS = {
-    "dispatch",
-    "bhej",
-    "bhejo",
-    "send",
-    "ship",
-    "deliver",
-    "delivery",
-    "invoice",
-    "bill",
-    "create",
-    "karo",
-    "kar",
-    "banao",
-    "make",
-}
-
-
-def _confidence(score: float) -> Confidence:
-    return Confidence(
-        score=score,
-        source=ConfidenceSource.RULE,
-    )
-
-
-def _normalize(text: str) -> str:
-    return " ".join(text.strip().split())
-
-
-def _trim_entity_phrase(value: str) -> str:
-    stop_words = (
-        " immediately",
-        " urgently",
-        " asap",
-        " and",
-        " then",
-        " dispatch",
-        " bhej",
-        " send",
-        " ship",
-        " deliver",
-        " delivery",
-        " invoice",
-        " bill",
-        " rate",
-        " price",
-        " plus",
-        " gst",
-        " tomorrow",
-        " today",
-        " yesterday",
-        " parso",
-        " kal",
-        " ko",
-    )
-
-    normalized = _normalize(value)
-    lowered = normalized.casefold()
-
-    cut_positions = [
-        lowered.find(stop)
-        for stop in stop_words
-        if lowered.find(stop) != -1
-    ]
-
-    if cut_positions:
-        normalized = normalized[: min(cut_positions)].strip()
-
-    return normalized
-
-
-def _is_valid_product_candidate(candidate: str) -> bool:
-    normalized = candidate.strip().casefold()
-
-    if not normalized:
-        return False
-
-    first_word = normalized.split()[0]
-
-    return first_word not in _PRODUCT_ACTION_STOPWORDS
-
-
-def _infer_intent(text: str) -> tuple[IntentType, float]:
-    lowered = text.casefold()
-
-    # Specific business actions must win over generic verbs such as
-    # "send"/"bhej", because sending an invoice for approval is not dispatch.
-    if any(
-        token in lowered
-        for token in (
-            "cancel order",
-            "cancel the order",
-        )
-    ):
-        return IntentType.CANCEL_ORDER, 0.95
-
-    if any(
-        token in lowered
-        for token in (
-            "update order",
-            "change order",
-            "modify order",
-        )
-    ):
-        return IntentType.UPDATE_ORDER, 0.94
-
-    if any(
-        token in lowered
-        for token in (
-            "invoice",
-            "bill",
-            "billing",
-            "invoice bana",
-            "invoice create",
-        )
-    ):
-        return IntentType.CREATE_INVOICE, 0.95
-
-    if any(
-        token in lowered
-        for token in (
-            "inventory",
-            "stock",
-            "available quantity",
-            "kitna stock",
-            "stock kitna",
-        )
-    ):
-        return IntentType.CHECK_INVENTORY, 0.96
-
-    if any(
-        token in lowered
-        for token in (
-            "price",
-            "rate",
-            "cost",
-            "kitne ka",
-            "kitna rate",
-        )
-    ) and not any(
-        token in lowered
-        for token in (
-            "dispatch",
-            "dispatch karo",
-            "dispatch kar",
-        )
-    ):
-        return IntentType.CHECK_PRICE, 0.94
-
-    if any(
-        token in lowered
-        for token in (
-            "dispatch",
-            "dispatch karo",
-            "dispatch kar",
-            "ship",
-            "deliver",
-            "delivery",
-        )
-    ):
-        return IntentType.CREATE_DISPATCH_ORDER, 0.96
-
-    if any(
-        token in lowered
-        for token in (
-            "notify",
-            "notification",
-            "message",
-        )
-    ):
-        return IntentType.SEND_NOTIFICATION, 0.91
-
-    if any(
-        token in lowered
-        for token in (
-            "order",
-            "create order",
-            "place order",
-            "order bana",
-        )
-    ):
-        return IntentType.CREATE_ORDER, 0.94
-
-    return IntentType.UNKNOWN, 0.20
-
-
-def _extract_customer(text: str) -> SemanticEntity | None:
-    match = _CUSTOMER_PATTERN.search(text)
-
-    if match is None:
-        return None
-
-    value = _trim_entity_phrase(match.group("name"))
-
-    if not value:
-        return None
-
+def _entity(mention: Mention, entity_type: SemanticEntityType) -> SemanticEntity:
     return SemanticEntity(
-        entity_id=uuid4(),
-        entity_type=SemanticEntityType.CUSTOMER,
-        surface_text=value,
-        normalized_text=value.casefold(),
-        confidence=_confidence(0.90),
+        entity_id=mention.mention_id,
+        entity_type=entity_type,
+        surface_text=mention.surface,
+        normalized_text=mention.normalized,
+        span=_span(mention),
+        confidence=conf.rule(mention.confidence),
     )
 
 
-def _extract_product(text: str) -> SemanticEntity | None:
-    match = _PRODUCT_AFTER_QUANTITY_PATTERN.search(text)
-
-    if match is None:
-        match = _PRODUCT_EXPLICIT_PATTERN.search(text)
-
-    if match is None:
-        return None
-
-    value = _trim_entity_phrase(match.group("product"))
-
-    if not _is_valid_product_candidate(value):
-        return None
-
-    if not value:
-        return None
-
-    return SemanticEntity(
-        entity_id=uuid4(),
-        entity_type=SemanticEntityType.PRODUCT,
-        surface_text=value,
-        normalized_text=value.casefold(),
-        confidence=_confidence(0.88),
+def _quantity(mention: Mention) -> SemanticQuantity:
+    assert mention.value is not None
+    return SemanticQuantity(
+        value=mention.value,
+        unit=mention.unit,
+        surface_text=mention.surface,
+        span=_span(mention),
+        confidence=conf.rule(mention.confidence),
     )
 
 
-def _extract_quantities(
-    text: str,
-) -> tuple[list[Quantity], list[re.Match[str]]]:
-    matches = list(_QUANTITY_PATTERN.finditer(text))
-
-    quantities = [
-        Quantity(
-            value=Decimal(match.group("value")),
-            unit=match.group("unit").casefold(),
-            confidence=_confidence(0.98),
-        )
-        for match in matches
-    ]
-
-    return quantities, matches
-
-
-def _extract_price_entity(text: str) -> SemanticEntity | None:
-    match = _PRICE_CONTEXT_PATTERN.search(text)
-
-    if match is None:
-        return None
-
-    price = match.group("price")
-
-    return SemanticEntity(
-        entity_id=uuid4(),
-        entity_type=SemanticEntityType.PRICE,
-        surface_text=price,
-        normalized_text=price,
-        confidence=_confidence(0.94),
+def _correction_value(mention: Mention, field: CorrectionField) -> CorrectionValue:
+    numeric = field in (CorrectionField.QUANTITY, CorrectionField.UNIT, CorrectionField.PRICE)
+    if numeric and mention.value is not None:
+        unit = mention.per_unit if field is CorrectionField.PRICE else mention.unit
+        amount = format(mention.value.normalize(), "f")
+        normalized = f"{amount} {unit}" if unit else amount
+    else:
+        normalized = mention.normalized
+    return CorrectionValue(
+        surface_text=mention.surface,
+        normalized=normalized,
+        amount=mention.value if numeric else None,
+        unit=(mention.per_unit if field is CorrectionField.PRICE else mention.unit)
+        if numeric
+        else None,
+        span=_span(mention),
     )
-
-
-def _extract_constraints(text: str) -> list[SemanticConstraint]:
-    constraints: list[SemanticConstraint] = []
-
-    lowered = text.casefold()
-
-    if "plus gst" in lowered or "including gst" in lowered:
-        operator = "ADD" if "plus gst" in lowered else "INCLUDE"
-
-        surface = (
-            "plus GST"
-            if "plus gst" in lowered
-            else "including GST"
-        )
-
-        constraints.append(
-            SemanticConstraint(
-                field="tax",
-                operator=operator,
-                value="GST",
-                surface_text=surface,
-                confidence=_confidence(0.96),
-            )
-        )
-
-    return constraints
-
-
-def _extract_urgency(text: str) -> Urgency:
-    lowered = text.casefold()
-
-    if any(token in lowered for token in _URGENCY_CRITICAL):
-        return Urgency.CRITICAL
-
-    if any(token in lowered for token in _URGENCY_HIGH):
-        return Urgency.HIGH
-
-    return Urgency.NORMAL
-
-
-def _extract_requested_actions(
-    text: str,
-    intent: IntentType,
-) -> list[RequestedAction]:
-    lowered = text.casefold()
-    actions: list[RequestedAction] = []
-
-    def add(
-        action_type: RequestedActionType,
-        explicit: bool = True,
-        score: float = 0.94,
-    ) -> None:
-        if any(action.action_type == action_type for action in actions):
-            return
-
-        actions.append(
-            RequestedAction(
-                action_type=action_type,
-                explicit=explicit,
-                confidence=_confidence(score),
-            )
-        )
-
-    if intent is IntentType.CREATE_ORDER:
-        add(RequestedActionType.CREATE_ORDER)
-
-    if intent is IntentType.CREATE_DISPATCH_ORDER:
-        add(RequestedActionType.DISPATCH)
-
-    if intent is IntentType.CREATE_INVOICE:
-        add(RequestedActionType.CREATE_INVOICE_DRAFT)
-
-    if intent in (
-        IntentType.CHECK_INVENTORY,
-        IntentType.CHECK_PRICE,
-    ):
-        add(
-            RequestedActionType.CHECK,
-            score=0.97,
-        )
-
-    if intent is IntentType.SEND_NOTIFICATION:
-        add(RequestedActionType.NOTIFY_CUSTOMER)
-
-    if any(
-        phrase in lowered
-        for phrase in (
-            "invoice bana ke approve",
-            "invoice bana kar approve",
-            "send for approval",
-            "approval",
-            "approve",
-        )
-    ):
-        add(
-            RequestedActionType.REQUEST_APPROVAL,
-            score=0.98,
-        )
-
-    if any(
-        phrase in lowered
-        for phrase in (
-            "notify",
-            "notification",
-            "whatsapp pe bhej",
-            "whatsapp me bhej",
-        )
-    ):
-        add(RequestedActionType.NOTIFY_CUSTOMER)
-
-    return actions
-
-
-def _determine_actionability(
-    intent: IntentType,
-    ambiguities: list,
-) -> Actionability:
-    if intent is IntentType.UNKNOWN:
-        return Actionability.BLOCKED
-
-    if ambiguities:
-        return Actionability.CLARIFICATION_REQUIRED
-
-    return Actionability.COMPLETE
 
 
 class SemanticCompiler:
-    """
-    Deterministic baseline semantic compiler.
+    """Deterministic, rule-based Transcript → SemanticState compiler."""
 
-    Input:
-        Transcript
+    def __init__(self, *, clock: Callable[[], datetime] | None = None) -> None:
+        self._clock = clock or (lambda: datetime.now(UTC))
 
-    Output:
-        SemanticState
+    def compile(self, transcript: Transcript, *, run_id: UUID | None = None) -> SemanticState:
+        text = transcript.text
+        tokens = tokenize(text)
+        reserved: set[int] = set()
 
-    This component understands language only. It does not:
-    - resolve business IDs
-    - query business databases
-    - validate prices
-    - inspect inventory
-    - authorize actions
-    - execute tools
-    """
+        temporal = extract_temporal_mentions(text, tokens)
+        for mention in temporal:
+            reserved.update(mention.tokens())
 
-    def compile(self, transcript: Transcript) -> SemanticState:
-        text = _normalize(transcript.text)
+        addressee = extract_addressee(text, tokens, reserved)
+        prices = extract_price_mentions(text, tokens, reserved)
+        products = extract_product_mentions(text, tokens, reserved)
+        quantities = extract_quantity_mentions(text, tokens, reserved)
+        products += extract_positional_products(text, tokens, reserved, quantities)
 
-        intent, intent_score = _infer_intent(text)
+        reference_matches = extract_reference_matches(text, tokens)
+        for _, start, end in reference_matches:
+            reserved.update(range(start, end))
 
-        customer = _extract_customer(text)
-        product = _extract_product(text)
+        customers = extract_customer_mentions(text, tokens, reserved)
+        tax = extract_tax(text, tokens)
 
-        quantities, quantity_matches = _extract_quantities(text)
-
-        corrections = detect_quantity_corrections(
-            text,
-            quantity_matches,
+        records = detect_corrections(
+            tokens, [*temporal, *prices, *products, *quantities, *customers]
         )
+        replacements = {record.previous.mention_id: record.replacement for record in records}
+        superseded = set(replacements)
 
-        if corrections:
-            corrected = corrections[-1].corrected_value
+        def alive(mentions: Sequence[Mention], kind: MentionKind) -> list[Mention]:
+            return [m for m in mentions if m.kind is kind and m.mention_id not in superseded]
 
-            quantities = [
-                Quantity(
-                    value=Decimal(str(corrected["value"])),
-                    unit=str(corrected["unit"]),
-                    confidence=_confidence(0.99),
+        numeric = [*quantities, *prices]
+        ambiguities: list[Ambiguity] = []
+
+        # Customer ---------------------------------------------------------- #
+        live_customers = alive(customers, MentionKind.CUSTOMER)
+        distinct_customers = {m.normalized: m for m in live_customers}
+        customer: SemanticEntity | None = None
+        if len(distinct_customers) == 1:
+            customer = _entity(next(iter(distinct_customers.values())), SemanticEntityType.CUSTOMER)
+        elif len(distinct_customers) > 1:
+            ambiguities.append(amb.competing_customers([m.surface for m in live_customers]))
+
+        # Items ------------------------------------------------------------- #
+        drafts = bind_items(
+            tokens,
+            [m for m in numeric if m.kind in (MentionKind.QUANTITY, MentionKind.BARE_NUMBER)],
+            [m for m in products if m.kind is MentionKind.PRODUCT],
+            replacements,
+        )
+        items = [self._item(draft) for draft in drafts]
+        for draft in drafts:
+            if draft.conflicting_quantities and draft.product is not None:
+                ambiguities.append(
+                    amb.conflicting_quantities(
+                        draft.product.surface,
+                        [m.surface for m in draft.conflicting_quantities],
+                        draft.item_id,
+                    )
                 )
-            ]
 
-        entities: list[SemanticEntity] = []
-
-        if customer is not None:
-            entities.append(customer)
-
-        if product is not None:
-            entities.append(product)
-
-        price_entity = _extract_price_entity(text)
-
-        if price_entity is not None:
-            entities.append(price_entity)
-
-        references = extract_references(text)
-
-        temporal_expressions = extract_temporal_expressions(text)
-
-        ambiguous_dates = [
-            expression.surface_text
-            for expression in temporal_expressions
-            if expression.resolution_status.value == "AMBIGUOUS"
-        ]
-
-        ambiguities = build_temporal_ambiguities(
-            ambiguous_dates,
-        )
-
-        ambiguities.extend(
-            build_missing_field_ambiguities(
-                intent,
-                has_customer=customer is not None,
-                has_product=product is not None,
-                has_quantity=bool(quantities),
+        # References and their temporal anchors ----------------------------- #
+        temporal_by_id = {
+            m.mention_id: m.temporal
+            for m in alive(temporal, MentionKind.TEMPORAL)
+            if m.temporal is not None
+        }
+        temporal_mentions = {m.mention_id: m for m in temporal if m.mention_id in temporal_by_id}
+        references: list[SemanticReference] = []
+        for reference, start, end in reference_matches:
+            linked = self._linked_temporal(tokens, start, end, temporal_mentions.values())
+            item_id = self._reference_item(reference, start, drafts)
+            if linked is not None:
+                expression = temporal_by_id[linked.mention_id]
+                temporal_by_id[linked.mention_id] = anchor_to_reference(
+                    expression, reference.surface_text
+                )
+            references.append(
+                SemanticReference.model_validate(
+                    {
+                        **reference.model_dump(),
+                        "item_id": item_id,
+                        "temporal_expression_id": linked.mention_id if linked else None,
+                    }
+                )
             )
-        )
 
-        requested_actions = _extract_requested_actions(
+        # Requested actions and intent --------------------------------------- #
+        marker_tokens = {
+            i for record in records for i in range(record.marker.start, record.marker.end)
+        }
+        goods_tokens = {
+            i
+            for draft in drafts
+            for m in (draft.product, draft.quantity)
+            if m is not None
+            for i in m.tokens()
+        }
+        # "send it" / "usko bhejo": the pronoun object stands for the goods.
+        goods_tokens.update(
+            i
+            for reference, start, end in reference_matches
+            if reference.reference_type in (ReferenceType.PRONOUN, ReferenceType.PRODUCT)
+            for i in range(start, end)
+        )
+        actions = extract_requested_actions(
             text,
-            intent,
+            tokens,
+            goods_tokens=goods_tokens,
+            customer_tokens={i for m in live_customers for i in m.tokens()},
+            correction_tokens=marker_tokens,
         )
+        decision = decide_intent(actions)
+        if decision.conflicting:
+            ambiguities.append(amb.competing_actions(decision.conflicting))
 
-        constraints = _extract_constraints(text)
-
-        actionability = _determine_actionability(
-            intent,
-            ambiguities,
+        temporal_expressions = self._target_temporal(
+            tokens, temporal_mentions, temporal_by_id, actions
         )
+        ambiguities.extend(amb.temporal_ambiguities(temporal_expressions))
+
+        # Pricing ------------------------------------------------------------ #
+        pricing, price_ambiguities, price_ids = self._pricing(
+            tokens,
+            [m for m in numeric if m.kind is MentionKind.PRICE and m.mention_id not in superseded],
+            references,
+            reference_matches,
+            drafts,
+        )
+        ambiguities.extend(price_ambiguities)
+
+        corrections = [self._correction(text, record, drafts, price_ids) for record in records]
 
         return SemanticState(
             semantic_state_id=uuid4(),
-            intent=intent,
-            intent_confidence=_confidence(intent_score),
-            entities=entities,
-            quantities=quantities,
-            temporal_expressions=temporal_expressions,
+            run_id=run_id,
+            source_transcript_id=transcript.transcript_id,
+            compiler=CompilerProvenance(
+                compiler_name=COMPILER_NAME, compiler_version=COMPILER_VERSION
+            ),
+            intent=decision.intent,
+            intent_confidence=conf.rule(decision.confidence),
+            customer=customer,
+            addressee=_entity(addressee, SemanticEntityType.PERSON) if addressee else None,
+            items=items,
+            pricing=pricing,
+            tax=tax,
             references=references,
-            constraints=constraints,
+            temporal_expressions=temporal_expressions,
             corrections=corrections,
             ambiguities=ambiguities,
-            requested_actions=requested_actions,
-            urgency=_extract_urgency(text),
-            actionability=actionability,
-            source_transcript_id=transcript.transcript_id,
-            created_at=datetime.now(UTC),
+            requested_actions=actions,
+            urgency=extract_urgency(tokens),
+            created_at=self._clock(),
+        )
+
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _item(draft: ItemDraft) -> SemanticItem:
+        return SemanticItem(
+            item_id=draft.item_id,
+            product=_entity(draft.product, SemanticEntityType.PRODUCT) if draft.product else None,
+            quantity=_quantity(draft.quantity) if draft.quantity else None,
+        )
+
+    @staticmethod
+    def _linked_temporal(
+        tokens: Sequence[Token],
+        start: int,
+        end: int,
+        temporal: Iterable[Mention],
+    ) -> Mention | None:
+        sentence = tokens[start].sentence
+        for mention in temporal:
+            if tokens[mention.start].sentence != sentence:
+                continue
+            after = 0 <= mention.start - end <= _REFERENCE_TEMPORAL_WINDOW_AFTER
+            before = 0 <= start - mention.end <= _REFERENCE_TEMPORAL_WINDOW_BEFORE
+            if after or before:
+                return mention
+        return None
+
+    @staticmethod
+    def _reference_item(
+        reference: SemanticReference,
+        start: int,
+        drafts: Sequence[ItemDraft],
+    ) -> UUID | None:
+        """Attach "200 bags of the same product" to the item it completes."""
+        if reference.reference_type is not ReferenceType.PRODUCT:
+            return None
+        for draft in drafts:
+            if (
+                draft.product is None
+                and draft.quantity is not None
+                and 0 <= start - draft.quantity.end <= 2
+            ):
+                return draft.item_id
+        return None
+
+    @staticmethod
+    def _target_temporal(
+        tokens: Sequence[Token],
+        mentions: dict[UUID, Mention],
+        expressions: dict[UUID, TemporalExpression],
+        actions: Sequence[RequestedAction],
+    ) -> list[TemporalExpression]:
+        by_char = {token.start: token for token in tokens}
+        execution_sentences = {
+            by_char[action.span.start].sentence
+            for action in actions
+            if action.action_type in _EXECUTION_ACTIONS and action.span.start in by_char
+        }
+        result: list[TemporalExpression] = []
+        for mention_id, expression in expressions.items():
+            if (
+                expression.target is TemporalTarget.UNSPECIFIED
+                and tokens[mentions[mention_id].start].sentence in execution_sentences
+            ):
+                expression = TemporalExpression.model_validate(
+                    {**expression.model_dump(), "target": TemporalTarget.EXECUTION}
+                )
+            result.append(expression)
+        return sorted(result, key=lambda expression: expression.span.start)
+
+    @staticmethod
+    def _price_item(
+        tokens: Sequence[Token],
+        start: int,
+        per_unit: str | None,
+        drafts: Sequence[ItemDraft],
+    ) -> UUID | None:
+        if len(drafts) == 1:
+            return drafts[0].item_id
+        if per_unit is not None:
+            matching = [draft for draft in drafts if draft.unit == per_unit]
+            if len(matching) == 1:
+                return matching[0].item_id
+        sentence = tokens[start].sentence
+        for draft in drafts:
+            if tokens[draft.start].sentence == sentence and 0 <= start - draft.end <= 3:
+                return draft.item_id
+        return None
+
+    def _pricing(
+        self,
+        tokens: Sequence[Token],
+        spoken: Sequence[Mention],
+        references: Sequence[SemanticReference],
+        reference_matches: Sequence[tuple[SemanticReference, int, int]],
+        drafts: Sequence[ItemDraft],
+    ) -> tuple[list[SemanticPrice], list[Ambiguity], dict[UUID, UUID]]:
+        reference_tokens = {
+            ref.reference_id: (start, end) for (ref, start, end) in reference_matches
+        }
+        historical = [
+            reference
+            for reference in references
+            if reference.reference_type in _HISTORICAL_PRICE_REFERENCES
+        ]
+        used_references: set[UUID] = set()
+        pricing: list[SemanticPrice] = []
+        ambiguities: list[Ambiguity] = []
+        price_ids: dict[UUID, UUID] = {}
+
+        for mention in spoken:
+            assert mention.value is not None
+            sentence = tokens[mention.start].sentence
+            linked = next(
+                (
+                    reference
+                    for reference in historical
+                    if reference.reference_id not in used_references
+                    and tokens[reference_tokens[reference.reference_id][0]].sentence == sentence
+                ),
+                None,
+            )
+            if linked is not None:
+                used_references.add(linked.reference_id)
+
+            price = SemanticPrice(
+                price_id=uuid4(),
+                source=(
+                    PriceSource.SPOKEN_WITH_HISTORICAL_REFERENCE if linked else PriceSource.SPOKEN
+                ),
+                amount=mention.value,
+                currency=mention.currency,
+                per_unit=mention.per_unit,
+                item_id=self._price_item(tokens, mention.start, mention.per_unit, drafts),
+                reference_id=linked.reference_id if linked else None,
+                surface_text=mention.surface,
+                span=_span(mention),
+                confidence=conf.rule(mention.confidence),
+            )
+            price_ids[mention.mention_id] = price.price_id
+            pricing.append(price)
+
+        for reference in historical:
+            if reference.reference_id in used_references:
+                continue
+            start, _ = reference_tokens[reference.reference_id]
+            pricing.append(
+                SemanticPrice(
+                    price_id=uuid4(),
+                    source=PriceSource.HISTORICAL_REFERENCE,
+                    item_id=self._price_item(tokens, start, None, drafts),
+                    reference_id=reference.reference_id,
+                    surface_text=reference.surface_text,
+                    span=reference.span,
+                    confidence=reference.confidence,
+                )
+            )
+
+        for price in pricing:
+            if price.item_id is None and len(drafts) > 1:
+                ambiguities.append(
+                    amb.unscoped_price(
+                        price.surface_text, price.price_id, [d.item_id for d in drafts]
+                    )
+                )
+
+        by_item: dict[UUID | None, list[SemanticPrice]] = {}
+        for price in pricing:
+            if price.amount is not None:
+                by_item.setdefault(price.item_id, []).append(price)
+        for group in by_item.values():
+            if len({(price.amount, price.per_unit) for price in group}) > 1:
+                ambiguities.append(
+                    amb.conflicting_prices(
+                        [price.surface_text for price in group],
+                        [price.price_id for price in group],
+                    )
+                )
+
+        return sorted(pricing, key=lambda p: p.span.start), ambiguities, price_ids
+
+    @staticmethod
+    def _correction(
+        text: str,
+        record: CorrectionRecord,
+        drafts: Sequence[ItemDraft],
+        price_ids: dict[UUID, UUID],
+    ) -> CorrectionEvent:
+        replacement = record.replacement
+        target_id: UUID | None
+        if record.field is CorrectionField.PRICE:
+            target_id = price_ids.get(replacement.mention_id)
+        elif record.field in (CorrectionField.QUANTITY, CorrectionField.UNIT):
+            target_id = next(
+                (
+                    draft.item_id
+                    for draft in drafts
+                    if draft.quantity is not None
+                    and draft.quantity.mention_id == replacement.mention_id
+                ),
+                None,
+            )
+        elif record.field is CorrectionField.PRODUCT:
+            target_id = next(
+                (
+                    draft.item_id
+                    for draft in drafts
+                    if draft.product is not None
+                    and draft.product.mention_id == replacement.mention_id
+                ),
+                None,
+            )
+        else:
+            target_id = replacement.mention_id
+
+        start = min(record.previous.char_start, replacement.char_start)
+        end = max(record.previous.char_end, replacement.char_end)
+        marker_tokens = " ".join(record.marker.words)
+
+        return CorrectionEvent(
+            correction_id=uuid4(),
+            field=record.field,
+            previous_value=_correction_value(record.previous, record.field),
+            corrected_value=_correction_value(replacement, record.field),
+            marker=marker_tokens,
+            target_id=target_id,
+            source_text=text[start:end],
+            confidence=conf.rule(record.confidence),
         )
