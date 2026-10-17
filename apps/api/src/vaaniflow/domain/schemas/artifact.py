@@ -22,4 +22,4 @@ class AudioArtifact(DomainSchema):
 
     metadata: AudioMetadata
 
-    created_at: datetime 
+    created_at: datetime

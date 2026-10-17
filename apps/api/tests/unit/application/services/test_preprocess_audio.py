@@ -96,6 +96,7 @@ class RecordingAudioPreprocessor:
             artifact_id=artifact_id,
             storage_ref="local://audio/processed.wav",
             metadata=metadata,
+            source_artifact_id=request.artifact_id,
         )
 
         return result, BytesIO(b"processed audio bytes")
@@ -126,10 +127,7 @@ def test_preprocess_audio_retrieves_processes_and_stores_audio() -> None:
     assert result.storage_ref == "local://audio/processed.wav"
     assert preprocessor.request == request
     assert preprocessor.audio_bytes == b"raw audio bytes"
-    assert (
-        storage._artifacts["local://audio/processed.wav"]
-        == b"processed audio bytes"
-    )
+    assert storage._artifacts["local://audio/processed.wav"] == b"processed audio bytes"
 
 
 def test_preprocess_audio_returns_processed_metadata() -> None:

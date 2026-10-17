@@ -80,9 +80,7 @@ class RecordingASR:
             provider_request_id=None,
             language=request.language_hint,
             detected_languages=(
-                [request.language_hint]
-                if request.language_hint is not None
-                else []
+                [request.language_hint] if request.language_hint is not None else []
             ),
             text="Send 200 bags of cement",
             segments=[],

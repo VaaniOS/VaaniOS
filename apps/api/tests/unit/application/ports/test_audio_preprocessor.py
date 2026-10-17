@@ -73,6 +73,7 @@ class MockAudioPreprocessor:
             artifact_id=artifact_id,
             storage_ref="local://audio/processed.wav",
             metadata=metadata,
+            source_artifact_id=request.artifact_id,
         )
 
         return result, BytesIO(b"processed audio bytes")
