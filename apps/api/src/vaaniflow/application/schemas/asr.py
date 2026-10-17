@@ -14,5 +14,6 @@ class ASRInput(DomainSchema):
     """
 
     artifact_id: UUID
+    storage_ref: str = Field(min_length=1)
     metadata: AudioMetadata
     language_hint: str | None = Field(default=None, min_length=1)

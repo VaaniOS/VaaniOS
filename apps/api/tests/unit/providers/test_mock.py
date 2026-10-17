@@ -20,6 +20,7 @@ def make_asr_input(
 
     return ASRInput(
         artifact_id=artifact_id,
+        storage_ref="local://audio/test.wav",
         metadata=AudioMetadata(
             artifact_id=artifact_id,
             mime_type="audio/wav",
