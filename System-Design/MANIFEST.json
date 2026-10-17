@@ -1,0 +1,32 @@
+{
+  "project": "VaaniFlow",
+  "description": "Canonical detailed system-design reference for Claude Code and IDEs",
+  "documents": [
+    "README.md",
+    "01-system-overview.md",
+    "02-architecture.md",
+    "03-data-model.md",
+    "04-audio-pipeline.md",
+    "05-semantic-compiler.md",
+    "06-context-resolution.md",
+    "07-agent-orchestration.md",
+    "08-validation-policy-risk.md",
+    "09-execution-verification.md",
+    "10-human-handoff.md",
+    "11-sandbox-evaluation.md",
+    "12-observability.md",
+    "13-api-contracts.md",
+    "14-security-privacy.md",
+    "15-frontend.md",
+    "16-development-plan.md",
+    "17-demo-scenarios.md",
+    "18-architecture-decisions.md",
+    "19-testing-strategy.md",
+    "20-gnani-integration.md",
+    "21-event-system.md",
+    "22-repository-blueprint.md",
+    "23-state-machines.md",
+    "24-agent-reliability.md"
+  ],
+  "count": 25
+}
