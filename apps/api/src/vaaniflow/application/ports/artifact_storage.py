@@ -14,6 +14,14 @@ class ArtifactNotFoundError(ArtifactStorageError):
     """Raised when a requested artifact does not exist."""
 
 
+class ArtifactAlreadyExistsError(ArtifactStorageError):
+    """Raised when storing to a reference that already holds an artifact.
+
+    Artifacts are write-once so original audio evidence can never be
+    overwritten (ADR-011, ADR-016).
+    """
+
+
 class ArtifactStorage(Protocol):
     """
     Port for persistent storage of audio artifacts.
@@ -31,7 +39,12 @@ class ArtifactStorage(Protocol):
         """
         Persist an audio artifact.
 
-        The artifact's storage_ref identifies the destination.
+        The artifact's storage_ref identifies the destination. Storage is
+        write-once.
+
+        Raises:
+            ArtifactAlreadyExistsError: if the reference is already used.
+            ArtifactStorageError: for other storage failures.
         """
 
     def open(

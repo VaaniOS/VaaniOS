@@ -90,7 +90,8 @@ def test_local_preprocessor_normalizes_wav() -> None:
         assert reader.getnchannels() == 1
         assert reader.getsampwidth() == 2
 
-    assert result.storage_ref == "local://processed/audio/input.wav"
+    # Unique, write-once location keyed by the new artifact id.
+    assert result.storage_ref == f"local://processed/{result.artifact_id}.wav"
     assert result.metadata.sample_rate_hz == 16_000
     assert result.metadata.channels == 1
     assert result.metadata.codec == "pcm_s16le"
@@ -117,26 +118,71 @@ def test_local_preprocessor_rejects_invalid_audio() -> None:
         )
 
 
-def test_local_preprocessor_preserves_source_quality_metadata() -> None:
+def test_local_preprocessor_records_lineage_and_operations() -> None:
     request = make_request()
 
-    preprocessor = LocalAudioPreprocessor()
-
-    result, _ = preprocessor.preprocess(
+    result, _ = LocalAudioPreprocessor().preprocess(
         request=request,
-        audio=io.BytesIO(
-            make_wav(
-                sample_rate=8000,
-                channels=1,
-                frames=800,
-            )
-        ),
+        audio=io.BytesIO(make_wav(sample_rate=8000, channels=2, frames=800)),
     )
 
-    assert result.metadata.noise_level == request.metadata.noise_level
-    assert result.metadata.quality_class == request.metadata.quality_class
-    assert result.metadata.estimated_snr_db == request.metadata.estimated_snr_db
-    assert result.metadata.speech_ratio == request.metadata.speech_ratio
-    assert result.metadata.silence_ratio == request.metadata.silence_ratio
-    assert result.metadata.peak_level == request.metadata.peak_level
-    assert result.metadata.clipping_detected == request.metadata.clipping_detected
+    assert result.source_artifact_id == request.artifact_id
+    assert result.artifact_id != request.artifact_id
+    assert result.applied_operations == [
+        "decode_wav",
+        "downmix_mono",
+        "resample_16khz",
+        "encode_pcm16",
+        "analyze_quality",
+    ]
+
+
+def test_local_preprocessor_skips_operations_that_are_not_needed() -> None:
+    result, _ = LocalAudioPreprocessor().preprocess(
+        request=make_request(),
+        audio=io.BytesIO(make_wav(sample_rate=16_000, channels=1, frames=1600)),
+    )
+
+    assert result.applied_operations == ["decode_wav", "encode_pcm16", "analyze_quality"]
+
+
+def test_local_preprocessor_reprocessing_never_reuses_a_storage_ref() -> None:
+    preprocessor = LocalAudioPreprocessor()
+    request = make_request()
+
+    first, _ = preprocessor.preprocess(request=request, audio=io.BytesIO(make_wav()))
+    second, _ = preprocessor.preprocess(request=request, audio=io.BytesIO(make_wav()))
+
+    assert first.storage_ref != second.storage_ref
+
+
+def test_local_preprocessor_measures_quality_instead_of_copying_caller_metadata() -> None:
+    """The caller claims ACCEPTABLE audio; the processed signal is digital silence."""
+    request = make_request()
+
+    result, _ = LocalAudioPreprocessor().preprocess(
+        request=request,
+        audio=io.BytesIO(make_wav(sample_rate=8000, channels=1, frames=8000)),
+    )
+
+    assert request.metadata.quality_class is AudioQualityLevel.ACCEPTABLE
+    assert result.metadata.quality_class is AudioQualityLevel.UNUSABLE
+    assert result.metadata.speech_ratio == 0.0
+    assert result.metadata.silence_ratio == 1.0
+    assert result.metadata.peak_level is None
+    assert result.metadata.estimated_snr_db is None
+    assert result.metadata.noise_level is NoiseLevel.LOW
+
+
+def test_local_preprocessor_detects_clipping_in_the_source_signal() -> None:
+    output = io.BytesIO()
+    samples = np.full(16_000, 1.0, dtype=np.float32)
+    samples[::2] = -1.0
+    sf.write(output, samples, 16_000, format="WAV", subtype="PCM_16")
+
+    result, _ = LocalAudioPreprocessor().preprocess(
+        request=make_request(),
+        audio=io.BytesIO(output.getvalue()),
+    )
+
+    assert result.metadata.clipping_detected is True

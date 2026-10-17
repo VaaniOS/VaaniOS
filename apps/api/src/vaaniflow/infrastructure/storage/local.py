@@ -4,6 +4,7 @@ from io import BufferedIOBase
 from pathlib import Path, PurePosixPath
 
 from vaaniflow.application.ports.artifact_storage import (
+    ArtifactAlreadyExistsError,
     ArtifactNotFoundError,
     ArtifactStorage,
     ArtifactStorageError,
@@ -38,16 +39,16 @@ class LocalArtifactStorage:
     ) -> None:
         path = self._resolve_storage_ref(artifact.storage_ref)
 
-        path.parent.mkdir(parents=True, exist_ok=True)
-
         try:
-            with path.open("wb") as destination:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # "xb" fails if the file exists: artifacts are write-once.
+            with path.open("xb") as destination:
                 while chunk := data.read(1024 * 1024):
                     destination.write(chunk)
+        except FileExistsError as exc:
+            raise ArtifactAlreadyExistsError(artifact.storage_ref) from exc
         except OSError as exc:
-            raise ArtifactStorageError(
-                f"Failed to store artifact: {artifact.storage_ref}"
-            ) from exc
+            raise ArtifactStorageError(f"Failed to store artifact: {artifact.storage_ref}") from exc
 
     def open(
         self,
@@ -60,18 +61,14 @@ class LocalArtifactStorage:
             raise ArtifactNotFoundError(storage_ref)
 
         if not path.is_file():
-            raise ArtifactStorageError(
-                f"Artifact storage reference is not a file: {storage_ref}"
-            )
+            raise ArtifactStorageError(f"Artifact storage reference is not a file: {storage_ref}")
 
         try:
             return path.open("rb")
         except FileNotFoundError as exc:
             raise ArtifactNotFoundError(storage_ref) from exc
         except OSError as exc:
-            raise ArtifactStorageError(
-                f"Failed to open artifact: {storage_ref}"
-            ) from exc
+            raise ArtifactStorageError(f"Failed to open artifact: {storage_ref}") from exc
 
     def delete(
         self,
@@ -84,18 +81,14 @@ class LocalArtifactStorage:
             raise ArtifactNotFoundError(storage_ref)
 
         if not path.is_file():
-            raise ArtifactStorageError(
-                f"Artifact storage reference is not a file: {storage_ref}"
-            )
+            raise ArtifactStorageError(f"Artifact storage reference is not a file: {storage_ref}")
 
         try:
             path.unlink()
         except FileNotFoundError as exc:
             raise ArtifactNotFoundError(storage_ref) from exc
         except OSError as exc:
-            raise ArtifactStorageError(
-                f"Failed to delete artifact: {storage_ref}"
-            ) from exc
+            raise ArtifactStorageError(f"Failed to delete artifact: {storage_ref}") from exc
 
     def _resolve_storage_ref(self, storage_ref: str) -> Path:
         """
@@ -109,16 +102,12 @@ class LocalArtifactStorage:
         prefix = "local://"
 
         if not storage_ref.startswith(prefix):
-            raise ArtifactStorageError(
-                f"Unsupported artifact storage reference: {storage_ref}"
-            )
+            raise ArtifactStorageError(f"Unsupported artifact storage reference: {storage_ref}")
 
         relative_ref = storage_ref[len(prefix) :]
 
         if not relative_ref:
-            raise ArtifactStorageError(
-                "Artifact storage reference cannot be empty."
-            )
+            raise ArtifactStorageError("Artifact storage reference cannot be empty.")
 
         relative_path = PurePosixPath(relative_ref)
 
@@ -129,8 +118,7 @@ class LocalArtifactStorage:
 
         if ".." in relative_path.parts:
             raise ArtifactStorageError(
-                f"Artifact storage reference contains path traversal: "
-                f"{storage_ref}"
+                f"Artifact storage reference contains path traversal: {storage_ref}"
             )
 
         path = (self._root / Path(*relative_path.parts)).resolve()
@@ -139,8 +127,7 @@ class LocalArtifactStorage:
             path.relative_to(self._root)
         except ValueError as exc:
             raise ArtifactStorageError(
-                f"Artifact storage reference escapes storage root: "
-                f"{storage_ref}"
+                f"Artifact storage reference escapes storage root: {storage_ref}"
             ) from exc
 
         return path

@@ -16,7 +16,15 @@ from vaaniflow.application.schemas.audio_preprocessing import (
     AudioPreprocessingInput,
     AudioPreprocessingResult,
 )
+from vaaniflow.audio.quality import analyze_quality, detect_clipping
 from vaaniflow.domain.schemas.audio import AudioMetadata
+
+OPERATION_DECODE = "decode_wav"
+OPERATION_DOWNMIX = "downmix_mono"
+OPERATION_RESAMPLE = "resample_16khz"
+OPERATION_CLIP_GUARD = "clip_guard"
+OPERATION_ENCODE = "encode_pcm16"
+OPERATION_ANALYZE = "analyze_quality"
 
 
 class LocalAudioPreprocessor:
@@ -30,11 +38,13 @@ class LocalAudioPreprocessor:
     - converts audio to mono;
     - converts samples to 16-bit PCM;
     - resamples audio to 16 kHz;
-    - emits a canonical WAV artifact.
+    - emits a canonical WAV artifact;
+    - measures the processed artifact's quality metadata
+      (``vaaniflow.audio.quality``) instead of trusting the caller's.
 
-    Noise suppression, VAD, dereverberation, speech enhancement,
-    and quality analysis are separate concerns and are not silently
-    performed here.
+    Noise suppression, VAD trimming, dereverberation and speech
+    enhancement are not performed. The applied operations are recorded
+    on the result so lineage stays explicit.
     """
 
     TARGET_SAMPLE_RATE_HZ = 16_000
@@ -59,7 +69,7 @@ class LocalAudioPreprocessor:
             raise AudioPreprocessorInvalidInputError("Audio input cannot be empty.")
 
         try:
-            processed_audio = self._normalize_wav(raw_audio)
+            processed_audio, source_clipping, operations = self._normalize_wav(raw_audio)
         except (
             RuntimeError,
             TypeError,
@@ -72,28 +82,29 @@ class LocalAudioPreprocessor:
 
         artifact_id = uuid4()
 
-        metadata = self._build_metadata(
-            request=request,
+        metadata = describe_wav(
             artifact_id=artifact_id,
             wav_bytes=processed_audio,
+            clipping_detected=source_clipping,
         )
 
         result = AudioPreprocessingResult(
             artifact_id=artifact_id,
-            storage_ref=self._build_storage_ref(
-                source_storage_ref=request.storage_ref,
-            ),
+            storage_ref=self._build_storage_ref(artifact_id=artifact_id),
             metadata=metadata,
+            source_artifact_id=request.artifact_id,
+            applied_operations=[*operations, OPERATION_ANALYZE],
         )
 
         return result, io.BytesIO(processed_audio)
 
-    def _normalize_wav(self, raw_audio: bytes) -> bytes:
+    def _normalize_wav(self, raw_audio: bytes) -> tuple[bytes, bool, list[str]]:
         """
         Decode, normalize, resample, and encode a WAV artifact.
 
         SoundFile handles WAV decoding/encoding while SciPy performs
-        polyphase resampling.
+        polyphase resampling. Returns the WAV bytes, whether the decoded
+        source was clipped, and the operations applied.
         """
         source = io.BytesIO(raw_audio)
 
@@ -112,10 +123,16 @@ class LocalAudioPreprocessor:
         if samples.shape[1] <= 0:
             raise AudioPreprocessorInvalidInputError("WAV channel count must be positive.")
 
+        operations = [OPERATION_DECODE]
+        source_clipping = detect_clipping(samples.reshape(-1))
+
         # Convert multi-channel audio to mono by averaging channels.
         mono = np.mean(samples, axis=1, dtype=np.float32)
+        if samples.shape[1] > 1:
+            operations.append(OPERATION_DOWNMIX)
 
         if sample_rate != self.TARGET_SAMPLE_RATE_HZ:
+            operations.append(OPERATION_RESAMPLE)
             ratio = Fraction(
                 self.TARGET_SAMPLE_RATE_HZ,
                 sample_rate,
@@ -129,6 +146,8 @@ class LocalAudioPreprocessor:
 
         # Clip before PCM conversion so out-of-range floating-point
         # samples cannot wrap during quantization.
+        if np.any(np.abs(mono) > 1.0):
+            operations.append(OPERATION_CLIP_GUARD)
         mono = np.clip(mono, -1.0, 1.0)
 
         output = io.BytesIO()
@@ -141,70 +160,58 @@ class LocalAudioPreprocessor:
             subtype="PCM_16",
         )
 
-        return output.getvalue()
+        operations.append(OPERATION_ENCODE)
+        return output.getvalue(), source_clipping, operations
 
-    def _build_metadata(
-        self,
-        *,
-        request: AudioPreprocessingInput,
-        artifact_id: UUID,
-        wav_bytes: bytes,
-    ) -> AudioMetadata:
+    def _build_storage_ref(self, *, artifact_id: UUID) -> str:
         """
-        Build metadata from the resulting canonical WAV artifact.
+        Unique, write-once location for a processed artifact.
 
-        Existing source quality metadata is carried forward because this
-        implementation does not perform quality analysis.
+        Keyed by the new artifact id so re-processing never overwrites a
+        previously processed artifact (ADR-016).
         """
-        source_metadata = request.metadata
+        return f"local://processed/{artifact_id}.wav"
 
-        with io.BytesIO(wav_bytes) as wav_stream:
-            samples, sample_rate = sf.read(
-                wav_stream,
-                dtype="int16",
-                always_2d=True,
-            )
 
-        frame_count = samples.shape[0]
-        channels = samples.shape[1]
+def describe_wav(
+    *,
+    artifact_id: UUID,
+    wav_bytes: bytes,
+    clipping_detected: bool | None = None,
+) -> AudioMetadata:
+    """
+    Measure AudioMetadata for a WAV byte stream.
 
-        if frame_count <= 0:
-            raise AudioPreprocessorInvalidInputError("Processed WAV contains no frames.")
+    ``clipping_detected`` lets callers report clipping measured on an
+    earlier (pre-normalisation) signal; otherwise it is measured here.
+    """
+    with io.BytesIO(wav_bytes) as wav_stream:
+        info = sf.info(wav_stream)
+        wav_stream.seek(0)
+        samples, sample_rate = sf.read(wav_stream, dtype="float32", always_2d=True)
 
-        duration_ms = round(
-            frame_count / sample_rate * 1000,
-        )
+    if samples.shape[0] <= 0:
+        raise AudioPreprocessorInvalidInputError("WAV contains no frames.")
 
-        return AudioMetadata(
-            artifact_id=artifact_id,
-            mime_type="audio/wav",
-            codec="pcm_s16le",
-            sample_rate_hz=sample_rate,
-            channels=channels,
-            duration_ms=max(duration_ms, 1),
-            file_size_bytes=len(wav_bytes),
-            estimated_snr_db=source_metadata.estimated_snr_db,
-            speech_ratio=source_metadata.speech_ratio,
-            silence_ratio=source_metadata.silence_ratio,
-            peak_level=source_metadata.peak_level,
-            clipping_detected=source_metadata.clipping_detected,
-            noise_level=source_metadata.noise_level,
-            quality_class=source_metadata.quality_class,
-        )
+    mono = np.mean(samples, axis=1, dtype=np.float32)
+    analysis = analyze_quality(mono, sample_rate, clipping_detected=clipping_detected)
 
-    def _build_storage_ref(
-        self,
-        *,
-        source_storage_ref: str,
-    ) -> str:
-        """
-        Create a deterministic namespace for locally processed artifacts.
-        """
-        if source_storage_ref.startswith("local://"):
-            relative_path = source_storage_ref.removeprefix("local://")
-            return f"local://processed/{relative_path}"
-
-        return f"local://processed/{uuid4()}.wav"
+    return AudioMetadata(
+        artifact_id=artifact_id,
+        mime_type="audio/wav",
+        codec="pcm_s16le" if info.subtype == "PCM_16" else info.subtype.casefold(),
+        sample_rate_hz=sample_rate,
+        channels=samples.shape[1],
+        duration_ms=analysis.duration_ms,
+        file_size_bytes=len(wav_bytes),
+        estimated_snr_db=analysis.estimated_snr_db,
+        speech_ratio=analysis.speech_ratio,
+        silence_ratio=analysis.silence_ratio,
+        peak_level=analysis.peak_level_dbfs,
+        clipping_detected=analysis.clipping_detected,
+        noise_level=analysis.noise_level,
+        quality_class=analysis.quality_class,
+    )
 
 
 _: type[AudioPreprocessor] = LocalAudioPreprocessor

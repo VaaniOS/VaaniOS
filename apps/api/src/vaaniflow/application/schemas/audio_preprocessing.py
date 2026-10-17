@@ -33,3 +33,7 @@ class AudioPreprocessingResult(DomainSchema):
     artifact_id: UUID
     storage_ref: str = Field(min_length=1)
     metadata: AudioMetadata
+
+    # Lineage: the artifact this one was derived from and what was done.
+    source_artifact_id: UUID
+    applied_operations: list[str] = Field(default_factory=list)
