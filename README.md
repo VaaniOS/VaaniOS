@@ -310,9 +310,9 @@ transcript = Transcript(
 service = UnderstandTranscriptService(compiler=SemanticCompiler(), evaluator=InputEvaluator())
 result = service.execute(transcript=transcript)
 
-print(result.actionability)                                    # PARTIAL
+print(result.actionability)  # PARTIAL
 print([a.action_type.value for a in result.semantic_state.requested_actions])
-print(result.model_dump_json(indent=2))                        # the full handoff object
+print(result.model_dump_json(indent=2))  # the full handoff object
 ```
 
 ### Audio file → UnderstandResult (mock ASR, no network)
@@ -337,7 +337,7 @@ from vaaniflow.providers.mock import MockASR
 from vaaniflow.semantic import InputEvaluator, SemanticCompiler
 
 storage = LocalArtifactStorage(Path("./artifacts"))
-wav = Path("voice_note.wav").read_bytes()          # a PCM WAV file
+wav = Path("voice_note.wav").read_bytes()  # a PCM WAV file
 
 artifact_id = uuid4()
 artifact = IngestAudioService(artifact_storage=storage).execute(
@@ -388,8 +388,8 @@ from gnani.stt import GnaniSTTClient
 
 from vaaniflow.providers.gnani import GnaniASRProvider
 
-client = GnaniSTTClient()               # reads GNANI_API_KEY from the environment
-asr = GnaniASRProvider(client=client)   # format="verbatim", itn_native_numerals=False by default
+client = GnaniSTTClient()  # reads GNANI_API_KEY from the environment
+asr = GnaniASRProvider(client=client)  # format="verbatim", itn_native_numerals=False by default
 ```
 
 What the adapter does:
