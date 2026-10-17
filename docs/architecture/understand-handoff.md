@@ -73,8 +73,12 @@ These are not supported yet; ACT must not assume otherwise.
 - **Hedged quantities** ("around 200", "lagbhag 200") are kept as the stated
   value; the hedge is not represented. Treat quantities as exact claims to
   be confirmed by ACT policy.
-- **Preprocessing is WAV-only.** Opus (WhatsApp), MP3 and M4A are rejected by
-  the local preprocessor; no VAD trimming, denoising or enhancement is done.
+- **Audio formats: only WAV is covered by tests.** The local preprocessor
+  decodes through soundfile/libsndfile and always outputs 16 kHz mono PCM16
+  WAV. In the verified environment (libsndfile 1.2.2) it also decoded FLAC,
+  Ogg Vorbis, Ogg Opus (WhatsApp) and MP3, but these paths have no automated
+  tests. M4A/AAC is not supported. No VAD trimming, denoising or enhancement
+  is done.
 - **The live Gnani API is not exercised** by repository tests; the adapter
   is tested against a fake SDK client. Language/ITN defaults are unverified.
 - **No ASR confidence** is propagated (the Gnani REST response has none);
