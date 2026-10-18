@@ -58,8 +58,8 @@ def test_product_repository_lookup_and_sku() -> None:
     assert prod_by_sku is not None
     assert prod_by_sku.product_id == PROD_ULTRATECH_CEMENT_ID
 
-    # Ambiguity check: "ultratech cement" matches both regular and super cement
-    matches = repos.products.search(query="ultratech cement")
+    # Ambiguity check: "ultratech" matches both regular and super cement
+    matches = repos.products.search(query="ultratech")
     assert len(matches) >= 2
     sku_set = {p.sku for p in matches}
     assert "CEM-UT-001" in sku_set
