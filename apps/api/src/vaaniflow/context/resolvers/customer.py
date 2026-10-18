@@ -38,7 +38,7 @@ class CustomerResolver:
                     resolution_id=resolution_id,
                     entity_type="customer",
                     status=ResolutionStatus.NOT_FOUND,
-                    query="",
+                    query="<customer_unspecified>",
                     selected_entity_id=None,
                     candidates=[],
                     reason="No customer entity mentioned in semantic state.",

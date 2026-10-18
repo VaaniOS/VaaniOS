@@ -42,7 +42,7 @@ class InventoryResolver:
                     resolution_id=resolution_id,
                     entity_type="inventory",
                     status=ResolutionStatus.INVALID,
-                    query="",
+                    query="<product_unspecified>",
                     selected_entity_id=None,
                     candidates=[],
                     reason="Cannot check inventory without a resolved product.",

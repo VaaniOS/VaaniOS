@@ -39,7 +39,7 @@ class ProductResolver:
                     resolution_id=resolution_id,
                     entity_type="product",
                     status=ResolutionStatus.NOT_FOUND,
-                    query="",
+                    query="<product_unspecified>",
                     selected_entity_id=None,
                     candidates=[],
                     reason="No product entity in item.",
