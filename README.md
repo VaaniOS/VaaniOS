@@ -87,16 +87,14 @@ flowchart TD
 
     UR ==>|"handoff boundary"| CTX
 
-    subgraph ACT ["ACT — planned, not implemented"]
-        CTX["Business context resolution"] --> AG["Agent orchestration"]
-        AG --> VAL["Validation · risk · policy"]
-        VAL --> APR["Approval / human handoff"]
-        APR --> EXE["Execution"]
-        EXE --> VER["Verification"]
+    subgraph ACT ["ACT — implemented (synthetic in-memory business data)"]
+        CTX["Business context resolution<br/>customers · products · quotes · stock · tax · dates"] --> VAL["Validation · risk · policy<br/>(deterministic)"]
+        VAL --> PLAN["Plan<br/>requested − negated actions · duplicate check"]
+        PLAN --> APR["Confirmation / approval / human handoff"]
+        APR --> EXE["Execution<br/>idempotency keys · UNKNOWN handling"]
+        EXE --> VER["Read-back verification"]
+        VER --> AUD["Trace · audit trail"]
     end
-
-    classDef planned stroke-dasharray: 5 5,color:#777
-    class CTX,AG,VAL,APR,EXE,VER planned
 ```
 
 ### Layers inside UNDERSTAND
@@ -432,13 +430,15 @@ so the suite needs no credentials or network.
 pytest -q
 ```
 
-At the current checkpoint the suite collects and passes **296 tests**.
+At the time of writing the suite collects and passes **519 tests**.
 
 | Category | Location | What it covers |
 |---|---|---|
 | Unit | `apps/api/tests/unit/` | Storage, preprocessing and quality analysis, ASR adapters, tokenizer and number words, compiler, references, corrections, temporal parsing, ambiguity, input evaluation |
 | Contract | `apps/api/tests/contracts/` | `SemanticState` and `UnderstandResult` invariants, JSON round-trips, absence of business identifiers, existing ACT-side domain contracts |
-| Integration | `apps/api/tests/integration/` | End-to-end UNDERSTAND pipeline with real local storage and WAV preprocessing, mock ASR and a fake Gnani client |
+| Integration | `apps/api/tests/integration/` | End-to-end UNDERSTAND pipeline with real local storage and WAV preprocessing, mock ASR and a fake Gnani client; ACT orchestration and HTTP API |
+| ACT safety regressions | `apps/api/tests/integration/test_act_safety.py`, `test_api_approval.py`, `test_p1_*.py`, `test_p2_hardening.py` | Actionability and negation gates, approval binding and supersession, temporal quote matching, quote validity, pricing authority, UNKNOWN outcomes and reconciliation, partial execution, verification, duplicate orders, confirmation, operator resolution, audit trail — asserting repository state |
+| ACT unit | `apps/api/tests/unit/{context,validation,policy,execution,handoff,evaluation,traces,infrastructure}/` | Resolvers, validation engine, policy matrix, tools, verifier, approvals, handoff, sandbox scenarios A–J |
 | Safety regressions | `apps/api/tests/unit/semantic/test_safety_regressions.py` | Negation, product/customer/quantity/price alternatives, numeric fidelity, fallback products |
 
 Useful subsets:
@@ -486,21 +486,28 @@ VaaniOS/
         ├── src/vaaniflow/
         │   ├── domain/
         │   │   ├── schemas/       # SemanticState, UnderstandResult, Transcript, audio
-        │   │   ├── models/        # business models used by ACT (contracts only)
-        │   │   └── policies/      # decision / risk / authorization contracts
+        │   │   ├── models/        # business models used by ACT (orders, quotes, approvals, …)
+        │   │   └── policies/      # decision / risk / authorization models
         │   ├── application/
-        │   │   ├── ports/         # ArtifactStorage, ASRProvider, AudioPreprocessor
+        │   │   ├── ports/         # ArtifactStorage, ASRProvider, AudioPreprocessor, business data
         │   │   ├── schemas/       # ASRInput, preprocessing input/result
-        │   │   └── services/      # ingest, preprocess, transcribe, understand
+        │   │   └── services/      # ingest, preprocess, transcribe, understand,
+        │   │                      # orchestrator (ACT), run audit
         │   ├── audio/             # local preprocessor, quality analysis
         │   ├── providers/         # Gnani and mock ASR adapters
         │   ├── infrastructure/
-        │   │   └── storage/       # local write-once artifact storage
+        │   │   ├── storage/       # local write-once artifact storage
+        │   │   └── repositories/  # in-memory repositories + synthetic business data
         │   ├── semantic/          # compiler, references, corrections, temporal,
         │   │                      # ambiguity, input evaluation, lexicon
-        │   ├── context/           # business-context resolution contracts (ACT)
-        │   └── api/ config/ evaluation/ execution/
-        │       handoff/ traces/ validation/   # empty placeholders (not implemented)
+        │   ├── context/           # business-context resolution (ACT)
+        │   ├── validation/ policy/ # deterministic validation, risk, policy, confirmation
+        │   ├── execution/         # plans, tools, idempotent execution, verifier,
+        │   │                      # approvals, duplicate detection
+        │   ├── handoff/ traces/   # structured human handoff, run traces
+        │   ├── evaluation/        # failure-injection sandbox (scenarios A–J)
+        │   ├── api/               # FastAPI app and routers
+        │   └── config/
         └── tests/
             ├── unit/
             ├── contracts/
@@ -556,20 +563,41 @@ VaaniOS/
 - Typed `UnderstandResult` handoff and end-to-end application services
 - Unit, contract, integration and safety-regression tests; architecture docs and ADRs
 
+### Implemented (ACT)
+
+Over synthetic, in-memory business data (`infrastructure/repositories/synthetic_data.py`):
+
+- Context resolution: customers, products, quotes, inventory, tax rules, relative dates
+- Deterministic validation, risk scoring and a policy matrix (no LLM decides execution)
+- Explicit plans built only from requested − negated actions; one approval per plan
+- Approval bound to run, plan fingerprint and business snapshot, re-validated at execution
+- Execution with idempotency keys, read-back verification of every write, UNKNOWN handling
+- Structured human handoff, bound confirmation, operator resolution of UNKNOWN outcomes
+- Business-level duplicate order detection
+- Traces, an end-to-end audit endpoint, and a failure-injection sandbox (scenarios A–J)
+- FastAPI HTTP API (`apps/api/src/vaaniflow/api/`)
+
+### ACT safety semantics
+
+| Behaviour | Rule |
+|---|---|
+| Pricing authority | The execution price is the price of exactly one quote valid on the business date. A spoken price is a claim compared against it (mismatch → confirmation). **No applicable quote → no executable sale** (handoff); a referenced rate with no matching quote → clarification. No other quote is substituted. |
+| Historical references | "Rate wahi jo parso bataya tha" matches only quotes given on the date of the temporal expression linked to *the price's own reference*. "parso" is resolved against when the user spoke, not when approval happens. |
+| Approval | Every business write needs an approval bound to its run, plan fingerprint and business snapshot. A new instruction on the run supersedes any pending approval (`SUPERSEDED`, kept for audit). Approval re-validates; a changed plan or snapshot expires it. Approver identity is recorded for audit only — there is no authentication yet, so `actor_authenticated` is always `false` and identity never authorizes anything. |
+| Confirmation | A CONFIRM decision creates a confirmation bound to one run, the exact warnings asked about and the business snapshot. A yes/no reply (`POST /runs/{id}/confirm`) answers only that confirmation; if the facts changed it expires. Confirmation never executes — approval is still required. |
+| Duplicate orders | An open equivalent order (same customer, items, price, destination) blocks a new one; a completed one blocks only on the same business day. Orders the system creates stay `DRAFT` unless dispatched, so an identical undispatched request stays blocked until that order is handled. If orders cannot be read, nothing is created (handoff). |
+| Verification | Every planned write has a read-back contract (`execution/plan.py: VERIFICATION_CONTRACTS`); a tool without one is never planned. Only a verified step is reported as done. |
+| UNKNOWN outcomes | A timeout or exception after a write may have committed: the step is `UNKNOWN`, reconciled by read-back by idempotency key, never blindly retried. An operator can resolve it (`POST /runs/{id}/executions/{execution_id}/resolve`); success requires a verified record committed by that exact operation. History (`prior_*`, `resolution`) is never erased. |
+| Partial execution | Each step reports VERIFIED / FAILED / UNKNOWN / NOT_ATTEMPTED; runs end `COMPLETED`, `PARTIALLY_COMPLETED`, `FAILED` or `HANDOFF`. Nothing is rolled back and no rollback is claimed. Messages state record statuses (a DRAFT order reads as DRAFT). |
+| Business clock | Production uses the real clock. `VAANIFLOW_BUSINESS_CLOCK=synthetic` (or an ISO-8601 instant) pins the API to the synthetic dataset's 2026-10-17 12:00 IST for demos; the evaluation runner always uses it. |
+
 ### Next (not implemented)
 
-- Business context resolution (customers, products, quotes, inventory, tax, dates)
-- Agent orchestration and tool use
-- Validation, risk scoring and policy decisions
-- Human handoff, approval workflow
-- Execution with idempotency, and read-back verification
-- Sandbox / failure-injection evaluation lab
-- Tracing and observability
-- HTTP API, operator dashboard, WhatsApp/telephony integrations
+- Authentication and authorization of operators (identities are recorded, not verified)
+- Persistent storage (all repositories are in-memory)
+- Operator dashboard, WhatsApp/telephony integrations
 - Text-to-speech responses (Gnani Timbre in the design)
-
-The domain contracts for several ACT concepts (business models, validation, decision,
-risk, handoff) exist as typed schemas, but no logic uses them yet.
+- Multi-item orders, catalog or operator-set pricing
 
 ---
 
@@ -586,7 +614,7 @@ risk, handoff) exist as typed schemas, but no logic uses them yet.
 5. **Negation must never silently invert intent.** "Don't dispatch" is recorded as a
    negated action, not a dispatch.
 6. **Business facts belong to business context**, not to model output.
-7. **Consequential execution requires validation and verification** (ACT, planned).
+7. **Consequential execution requires validation, approval and verification.**
 8. **Provider integrations stay replaceable** behind ports.
 9. **Domain contracts are explicit and typed** — strict Pydantic models that reject
    unknown fields.
@@ -617,7 +645,18 @@ risk, handoff) exist as typed schemas, but no logic uses them yet.
   conservatively treated as negation.
 - **Unusable audio still reaches ASR**; input evaluation blocks it afterwards.
 - **No event/commitment extraction** ([System-Design 21](System-Design/21-event-system.md)).
-- **ACT-side business validation and execution are not implemented.**
+- **ACT runs on synthetic in-memory data only**; nothing is persisted across restarts.
+- **One line item per request**; multi-item requests are clarified, not executed.
+- **No catalog prices**: a customer without an applicable quote cannot be sold to by
+  voice (ADR-019). `ACCEPTED` quotes are not treated as executable pricing because the
+  model does not define their semantics.
+- **Clarification replies are not merged**: `/clarify` takes a complete new instruction;
+  the open clarification record (what was understood, what is missing) is preserved and
+  superseded, but partial answers are not merged into the earlier request.
+- **No authentication**: approver, rejector, confirmer and resolver identities are
+  recorded claims.
+- **Relative dates**: only day offsets (kal/parso/…) are resolved; a spoken weekday or
+  explicit date linked to a rate is treated as unresolved (clarification).
 - `numpy` is imported directly but is only installed transitively (via `scipy`).
 
 ---

@@ -1,20 +1,29 @@
-from uuid import UUID, uuid4
+from typing import Any
+from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, status
 
 from vaaniflow.api.dependencies import ContainerDep
 from vaaniflow.api.schemas import (
     ApproveRequest,
+    ClarificationView,
     ClarifyRequest,
+    ConfirmationView,
+    ConfirmRequest,
     CreateRunRequest,
     CreateRunResponse,
+    DuplicateView,
     ManualHandoffRequest,
     ProcessRunRequest,
     RejectRequest,
+    ResolveUnknownRequest,
     WorkflowResponse,
 )
+from vaaniflow.application.services.audit import RunAuditService
 from vaaniflow.application.services.orchestrator import ApprovalFlowError, WorkflowResult
+from vaaniflow.domain.models.tool_execution import ToolExecutionStatus
 from vaaniflow.domain.models.voice_run import VoiceRunStatus
+from vaaniflow.execution.service import OperatorResolutionError
 
 router = APIRouter(prefix="/runs", tags=["Runs"])
 
@@ -24,6 +33,19 @@ _APPROVAL_ERROR_STATUS = {
     "APPROVAL_RUN_MISMATCH": status.HTTP_409_CONFLICT,
     "APPROVAL_NOT_PENDING": status.HTTP_409_CONFLICT,
     "APPROVAL_SUPERSEDED": status.HTTP_409_CONFLICT,
+    "CONFIRMATION_NOT_FOUND": status.HTTP_404_NOT_FOUND,
+    "CONFIRMATION_RUN_MISMATCH": status.HTTP_409_CONFLICT,
+    "CONFIRMATION_NOT_PENDING": status.HTTP_409_CONFLICT,
+    "CONFIRMATION_SUPERSEDED": status.HTTP_409_CONFLICT,
+    "EXECUTION_NOT_FOUND": status.HTTP_404_NOT_FOUND,
+    "EXECUTION_RUN_MISMATCH": status.HTTP_409_CONFLICT,
+    "NOT_UNKNOWN": status.HTTP_409_CONFLICT,
+    "ALREADY_RESOLVED": status.HTTP_409_CONFLICT,
+    "STALE_RESOLUTION": status.HTTP_409_CONFLICT,
+    "RESOLUTION_NOT_VERIFIED": status.HTTP_409_CONFLICT,
+    "RESOLUTION_CONTRADICTED": status.HTTP_409_CONFLICT,
+    "NO_VERIFICATION_CONTRACT": status.HTTP_409_CONFLICT,
+    "INVALID_RESOLUTION": status.HTTP_422_UNPROCESSABLE_CONTENT,
 }
 
 
@@ -55,10 +77,36 @@ def _to_response(result: WorkflowResult) -> WorkflowResponse:
         executed_tools=result.executed_tools,
         tool_outcomes=list(result.step_outcomes),
         superseded_approval_ids=list(result.superseded_approval_ids),
+        superseded_confirmation_ids=list(result.superseded_confirmation_ids),
+        superseded_clarification_ids=list(result.superseded_clarification_ids),
+        confirmation=ConfirmationView(
+            confirmation_id=result.confirmation.confirmation_id,
+            status=result.confirmation.status.value,
+            prompt=result.confirmation.prompt,
+            warnings=result.confirmation.warnings,
+        )
+        if result.confirmation
+        else None,
+        clarification=ClarificationView(
+            clarification_id=result.clarification.clarification_id,
+            reason_code=result.clarification.reason_code,
+            reason=result.clarification.reason,
+            unresolved=result.clarification.unresolved,
+            understood=result.clarification.understood,
+        )
+        if result.clarification
+        else None,
+        duplicate_check=DuplicateView(
+            status=result.duplicate_check.status.value,
+            reason=result.duplicate_check.reason,
+            duplicate_order_ids=result.duplicate_check.duplicate_order_ids,
+        )
+        if result.duplicate_check
+        else None,
     )
 
 
-def _approval_http_error(error: ApprovalFlowError) -> HTTPException:
+def _approval_http_error(error: ApprovalFlowError | OperatorResolutionError) -> HTTPException:
     return HTTPException(
         status_code=_APPROVAL_ERROR_STATUS.get(error.code, status.HTTP_409_CONFLICT),
         detail={"code": error.code, "message": error.message},
@@ -185,7 +233,7 @@ def approve_run(
         result = container.orchestrator.approve(
             run_id=run_id,
             approval_id=payload.approval_id,
-            approved_by=payload.approved_by or uuid4(),
+            approved_by=payload.approved_by,
         )
     except ApprovalFlowError as error:
         raise _approval_http_error(error) from error
@@ -203,7 +251,8 @@ def reject_run(
         result = container.orchestrator.reject(
             run_id=run_id,
             approval_id=payload.approval_id,
-            rejected_by=payload.rejected_by or uuid4(),
+            rejected_by=payload.rejected_by,
+            reason=payload.reason,
         )
     except ApprovalFlowError as error:
         raise _approval_http_error(error) from error
@@ -227,6 +276,57 @@ def clarify_run(
         run_id=run_id,
     )
     return _to_response(result)
+
+
+@router.post("/{run_id}/confirm", response_model=WorkflowResponse)
+def confirm_run(
+    run_id: UUID,
+    payload: ConfirmRequest,
+    container: ContainerDep,
+) -> WorkflowResponse:
+    """Answer the confirmation pending on this run. Never approves or executes."""
+    try:
+        result = container.orchestrator.confirm(
+            run_id=run_id,
+            reply=payload.reply,
+            confirmation_id=payload.confirmation_id,
+            confirmed_by=payload.confirmed_by,
+        )
+    except ApprovalFlowError as error:
+        raise _approval_http_error(error) from error
+    return _to_response(result)
+
+
+@router.post("/{run_id}/executions/{execution_id}/resolve", response_model=WorkflowResponse)
+def resolve_unknown_execution(
+    run_id: UUID,
+    execution_id: UUID,
+    payload: ResolveUnknownRequest,
+    container: ContainerDep,
+) -> WorkflowResponse:
+    """Operator resolution of one UNKNOWN execution, verified against business state."""
+    try:
+        result = container.orchestrator.resolve_unknown(
+            run_id=run_id,
+            execution_id=execution_id,
+            attempt=payload.attempt,
+            outcome=ToolExecutionStatus(payload.outcome),
+            reason=payload.reason,
+            resolved_by=payload.resolved_by,
+            entity_id=payload.entity_id,
+        )
+    except OperatorResolutionError as error:
+        raise _approval_http_error(error) from error
+    return _to_response(result)
+
+
+@router.get("/{run_id}/audit")
+def get_run_audit(run_id: UUID, container: ContainerDep) -> dict[str, Any]:
+    """End-to-end audit trail of the run, assembled from stored records."""
+    audit = RunAuditService(container.repositories).build(run_id=run_id)
+    if audit is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found.")
+    return audit
 
 
 @router.post("/{run_id}/handoff")

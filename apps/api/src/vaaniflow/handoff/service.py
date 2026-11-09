@@ -14,6 +14,61 @@ from vaaniflow.domain.schemas.semantic import SemanticState
 from vaaniflow.infrastructure.repositories.synthetic_data import SyntheticRepositories
 
 
+def interpret_semantic_state(semantic_state: SemanticState) -> dict[str, Any]:
+    """
+    What the system understood, as spoken (P2-J). This is the operator's view of
+    the request; it contains no resolved business facts and nothing invented.
+    """
+    return {
+        "intent": semantic_state.intent.value,
+        "actions": [a.action_type.value for a in semantic_state.requested_actions],
+        "negated_actions": [a.action_type.value for a in semantic_state.negated_actions],
+        "customer": semantic_state.customer.normalized_text if semantic_state.customer else None,
+        "items_count": len(semantic_state.items),
+        "items": [
+            {
+                "product": item.product.surface_text if item.product else None,
+                "quantity": str(item.quantity.value) if item.quantity else None,
+                "unit": item.quantity.unit if item.quantity else None,
+            }
+            for item in semantic_state.items
+        ],
+        "pricing": [
+            {
+                "source": price.source.value,
+                "spoken_amount": str(price.amount) if price.amount is not None else None,
+                "surface": price.surface_text,
+            }
+            for price in semantic_state.pricing
+        ],
+        "references": [
+            {
+                "type": ref.reference_type.value,
+                "surface": ref.surface_text,
+                "target_slot": ref.target_slot.value,
+                "temporal_expression_id": str(ref.temporal_expression_id)
+                if ref.temporal_expression_id
+                else None,
+            }
+            for ref in semantic_state.references
+        ],
+        "temporal_expressions": [
+            {
+                "id": str(expr.expression_id),
+                "surface": expr.surface_text,
+                "normalized": expr.normalized_expression,
+                "target": expr.target.value,
+            }
+            for expr in semantic_state.temporal_expressions
+        ],
+        "ambiguities": [
+            {"type": a.ambiguity_type.value, "slot": a.slot.value, "candidates": list(a.candidates)}
+            for a in semantic_state.ambiguities
+        ],
+        "confidence": float(semantic_state.intent_confidence.score),
+    }
+
+
 class HandoffService:
     """
     Service for creating, tracking, and resolving structured human handoff cases.
@@ -104,15 +159,7 @@ class HandoffService:
         # Collect interpreted request summary
         interpreted: dict[str, Any] = {}
         if semantic_state is not None:
-            interpreted = {
-                "intent": semantic_state.intent.value,
-                "actions": [a.action_type.value for a in semantic_state.requested_actions],
-                "customer": semantic_state.customer.normalized_text
-                if semantic_state.customer
-                else None,
-                "items_count": len(semantic_state.items),
-                "confidence": float(semantic_state.intent_confidence.score),
-            }
+            interpreted = interpret_semantic_state(semantic_state)
 
         # Derive recommended action if not explicitly given
         derived_recommendation = recommended_action

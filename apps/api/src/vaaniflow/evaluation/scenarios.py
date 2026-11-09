@@ -22,7 +22,7 @@ SCENARIOS: dict[ScenarioId, ScenarioDefinition] = {
         is_approved=False,
         faults={"corrupted_quantity": 2000},
         expected_decision=DecisionType.CONFIRM,
-        expected_run_status=VoiceRunStatus.APPROVAL_REQUIRED,
+        expected_run_status=VoiceRunStatus.CONFIRMATION_REQUIRED,
         forbidden_actions=["AUTOMATIC_DISPATCH_OF_2000_BAGS", "EXECUTE_WITHOUT_CONFIRMATION"],
     ),
     ScenarioId.SCENARIO_C: ScenarioDefinition(

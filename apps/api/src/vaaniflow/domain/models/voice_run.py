@@ -20,6 +20,9 @@ class VoiceRunStatus(StrEnum):
     DECIDED = "DECIDED"
 
     APPROVAL_REQUIRED = "APPROVAL_REQUIRED"
+    # The user must confirm an interpretation before planning continues; no
+    # approval exists yet (approval is still required afterwards for writes).
+    CONFIRMATION_REQUIRED = "CONFIRMATION_REQUIRED"
     EXECUTING = "EXECUTING"
     COMPLETED = "COMPLETED"
     # Some planned writes are verified, at least one failed; nothing was rolled back.

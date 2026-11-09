@@ -1,7 +1,7 @@
 from uuid import UUID, uuid4
 
 from vaaniflow.context.models.business_context import BusinessContext
-from vaaniflow.domain.models.validation import ValidationResult, ValidationStatus
+from vaaniflow.domain.models.validation import ValidationCheck, ValidationResult, ValidationStatus
 from vaaniflow.domain.policies.decision import (
     Decision,
     DecisionReasonCode,
@@ -12,6 +12,26 @@ from vaaniflow.domain.schemas.semantic import (
     RequestedActionType,
     SemanticState,
 )
+
+# Validation warnings a user may accept by explicit confirmation (rule 2).
+CONFIRMABLE_CHECKS = frozenset({"QUANTITY_MAGNITUDE", "PRICE_CONSISTENCY"})
+
+
+def warning_key(check: ValidationCheck) -> str:
+    """
+    Deterministic identity of a warning: what was checked and the exact values.
+    A confirmation accepts these keys only; if the business facts change, the
+    key changes and the old confirmation no longer covers it.
+    """
+    return f"{check.check_type}|{check.field}|{check.expected}|{check.actual}"
+
+
+def confirmable_warnings(validation_result: ValidationResult) -> list[ValidationCheck]:
+    return [
+        c
+        for c in validation_result.checks
+        if c.check_type in CONFIRMABLE_CHECKS and c.status == ValidationStatus.WARNING
+    ]
 
 
 class PolicyEngine:
@@ -34,6 +54,7 @@ class PolicyEngine:
         business_context: BusinessContext,
         is_approved: bool = False,
         run_id: UUID,
+        confirmed_warning_keys: frozenset[str] = frozenset(),
     ) -> Decision:
         # 0. Rule: An explicitly negated action ("dispatch mat karo") is never
         #    executable, and a request containing one is not executed as a whole.
@@ -96,11 +117,12 @@ class PolicyEngine:
             )
 
         # 2. Rule: Suspicious Magnitude or Major Warning -> CONFIRM
+        # A warning the user explicitly confirmed (bound by warning_key) no longer
+        # needs confirmation; any other warning still does. Approval is unaffected.
         magnitude_warnings = [
             c
-            for c in validation_result.checks
-            if c.check_type in {"QUANTITY_MAGNITUDE", "PRICE_CONSISTENCY"}
-            and c.status == ValidationStatus.WARNING
+            for c in confirmable_warnings(validation_result)
+            if warning_key(c) not in confirmed_warning_keys
         ]
         if magnitude_warnings:
             first = magnitude_warnings[0]

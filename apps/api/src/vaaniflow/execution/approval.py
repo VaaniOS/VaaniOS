@@ -21,16 +21,21 @@ class ApprovalService:
         self,
         *,
         run_id: UUID,
-        requested_by: UUID,
         snapshot_version: str,
+        requested_by: UUID | None = None,
+        plan_id: UUID | None = None,
+        plan_fingerprint: str | None = None,
         order_id: UUID | None = None,
         invoice_id: UUID | None = None,
         now: datetime | None = None,
     ) -> Approval:
-        """Create a new approval request bound to the current context snapshot."""
+        """Create a new approval request bound to its run, plan and business snapshot."""
         current_time = now or datetime.now(UTC)
         approval = Approval(
             approval_id=uuid4(),
+            run_id=run_id,
+            plan_id=plan_id,
+            plan_fingerprint=plan_fingerprint,
             order_id=order_id,
             invoice_id=invoice_id,
             requested_by=requested_by,
@@ -45,7 +50,7 @@ class ApprovalService:
         self,
         *,
         approval_id: UUID,
-        approved_by: UUID,
+        approved_by: UUID | None,
         current_snapshot_version: str,
         now: datetime | None = None,
     ) -> Approval:
@@ -61,8 +66,10 @@ class ApprovalService:
 
         current_time = now or datetime.now(UTC)
 
+        approval.approved_snapshot_version = current_snapshot_version
         if approval.snapshot_version != current_snapshot_version:
             approval.status = ApprovalStatus.EXPIRED
+            approval.expiry_reason = "Business snapshot changed after approval was requested."
             approval.resolved_at = current_time
             self._repositories.approvals.save(approval=approval)
             return approval
@@ -77,7 +84,8 @@ class ApprovalService:
         self,
         *,
         approval_id: UUID,
-        rejected_by: UUID,
+        rejected_by: UUID | None,
+        reason: str | None = None,
         now: datetime | None = None,
     ) -> Approval:
         """Record explicit rejection of an approval request."""
@@ -87,7 +95,8 @@ class ApprovalService:
 
         current_time = now or datetime.now(UTC)
         approval.status = ApprovalStatus.REJECTED
-        approval.approved_by = rejected_by
+        approval.rejected_by = rejected_by
+        approval.rejection_reason = reason
         approval.resolved_at = current_time
         self._repositories.approvals.save(approval=approval)
         return approval
@@ -103,6 +112,25 @@ class ApprovalService:
         if approval.status is not ApprovalStatus.REQUESTED:
             return approval
         approval.status = ApprovalStatus.SUPERSEDED
+        approval.resolved_at = now or datetime.now(UTC)
+        self._repositories.approvals.save(approval=approval)
+        return approval
+
+    def expire(
+        self,
+        *,
+        approval_id: UUID,
+        reason: str,
+        observed_snapshot_version: str | None = None,
+        now: datetime | None = None,
+    ) -> Approval:
+        """Mark a REQUESTED approval EXPIRED with the reason it can no longer execute."""
+        approval = self._repositories.approvals.get_by_id(approval_id=approval_id)
+        if approval is None:
+            raise ValueError(f"Approval request {approval_id} not found.")
+        approval.approved_snapshot_version = observed_snapshot_version
+        approval.status = ApprovalStatus.EXPIRED
+        approval.expiry_reason = reason
         approval.resolved_at = now or datetime.now(UTC)
         self._repositories.approvals.save(approval=approval)
         return approval

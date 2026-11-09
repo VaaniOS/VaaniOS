@@ -18,6 +18,31 @@ from vaaniflow.execution.verifier import VerificationEngine
 from vaaniflow.infrastructure.repositories.synthetic_data import SyntheticRepositories
 
 
+def committed_record_id(
+    repositories: SyntheticRepositories, tool_name: str, idempotency_key: str
+) -> UUID | None:
+    """The business record a write tool committed under this idempotency key, if any."""
+    if tool_name == "create_order":
+        order = repositories.orders.get_by_idempotency_key(idempotency_key=idempotency_key)
+        return order.order_id if order else None
+    if tool_name == "create_invoice_draft":
+        invoice = repositories.invoices.get_by_idempotency_key(idempotency_key=idempotency_key)
+        return invoice.invoice_id if invoice else None
+    if tool_name == "dispatch_order":
+        dispatch = repositories.dispatches.get_by_idempotency_key(idempotency_key=idempotency_key)
+        return dispatch.dispatch_id if dispatch else None
+    return None
+
+
+class OperatorResolutionError(Exception):
+    """An operator resolution does not refer to a resolvable UNKNOWN execution."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
 @dataclass
 class ExecutionOutcome:
     """Consolidated outcome of an executed business action."""
@@ -456,19 +481,176 @@ class ExecutionService:
             now=now,
         )
 
+    # ------------------------------------------------------------------ #
+    # Operator resolution of an UNKNOWN outcome (P2-D)
+    # ------------------------------------------------------------------ #
+
+    def resolve_unknown_by_operator(
+        self,
+        *,
+        run_id: UUID,
+        execution_id: UUID,
+        attempt: int,
+        outcome: ToolExecutionStatus,
+        reason: str,
+        expected_state: dict[str, Any],
+        entity_id: UUID | None = None,
+        resolved_by: UUID | None = None,
+        now: datetime | None = None,
+    ) -> ExecutionOutcome:
+        """
+        Settle one UNKNOWN execution after an operator checked the business system.
+
+        The operator's word is evidence, not proof:
+        - SUCCEEDED requires a record committed by *this* operation (its
+          idempotency key) that passes read-back verification; an operation
+          that never wrote anything can never be marked successful.
+        - FAILED is refused if a record was committed under its key.
+        The execution keeps its UNKNOWN history in ``prior_*``.
+        """
+        current_time = now or datetime.now(UTC)
+        execution = self._repositories.tool_executions.get_by_id(execution_id=execution_id)
+        if execution is None:
+            raise OperatorResolutionError(
+                "EXECUTION_NOT_FOUND", f"Tool execution {execution_id} not found."
+            )
+        if execution.run_id != run_id:
+            raise OperatorResolutionError(
+                "EXECUTION_RUN_MISMATCH",
+                f"Tool execution {execution_id} does not belong to run {run_id}.",
+            )
+        if execution.status is not ToolExecutionStatus.UNKNOWN:
+            code = "ALREADY_RESOLVED" if execution.resolution else "NOT_UNKNOWN"
+            raise OperatorResolutionError(
+                code,
+                f"Tool execution {execution_id} is {execution.status.value}; only an UNKNOWN "
+                "outcome can be resolved.",
+            )
+        if attempt != execution.attempt:
+            raise OperatorResolutionError(
+                "STALE_RESOLUTION",
+                f"Resolution refers to attempt {attempt}, but the execution is at attempt "
+                f"{execution.attempt}.",
+            )
+        if outcome not in {ToolExecutionStatus.SUCCEEDED, ToolExecutionStatus.FAILED}:
+            raise OperatorResolutionError(
+                "INVALID_RESOLUTION", "An UNKNOWN outcome resolves to SUCCEEDED or FAILED only."
+            )
+
+        tool = self._registry.get(execution.tool_name)
+        entity_type = self._infer_entity_type(execution.tool_name)
+        committed = (
+            self._committed_entity_id(tool.name, execution.idempotency_key) if tool else None
+        )
+        history = {
+            "prior_status": execution.status,
+            "prior_error_code": execution.error_code,
+            "prior_error_message": execution.error_message,
+            "resolved_by": resolved_by,
+            "resolved_at": current_time,
+            "resolution_reason": reason,
+            "completed_at": current_time,
+        }
+
+        if outcome is ToolExecutionStatus.FAILED:
+            if committed is not None:
+                raise OperatorResolutionError(
+                    "RESOLUTION_CONTRADICTED",
+                    f"A {entity_type} ({committed}) was committed under this operation's key; "
+                    "it cannot be marked as failed.",
+                )
+            failed = execution.model_copy(
+                update={
+                    **history,
+                    "status": ToolExecutionStatus.FAILED,
+                    "error_code": "OPERATOR_CONFIRMED_FAILURE",
+                    "error_message": reason,
+                    "resolution": "OPERATOR_CONFIRMED_FAILURE",
+                }
+            )
+            self._repositories.tool_executions.save(execution=failed)
+            return ExecutionOutcome(
+                success=False,
+                execution=failed,
+                verification=None,
+                tool_result=ToolResult(
+                    success=False, error_code="OPERATOR_CONFIRMED_FAILURE", error_message=reason
+                ),
+                message=f"Operator confirmed {execution.tool_name} did not take effect: {reason}",
+            )
+
+        target = entity_id or committed
+        if target is None:
+            raise OperatorResolutionError(
+                "RESOLUTION_NOT_VERIFIED",
+                f"No {entity_type} was committed by this operation; success cannot be recorded.",
+            )
+        if committed is not None and target != committed:
+            raise OperatorResolutionError(
+                "RESOLUTION_NOT_VERIFIED",
+                f"{entity_type} {target} is not the record this operation committed ({committed}).",
+            )
+        # Only a record stamped with this operation's idempotency key proves that
+        # this operation wrote it; an equivalent record from elsewhere does not.
+        owner = self._record_idempotency_key(entity_type, target)
+        if owner != execution.idempotency_key:
+            raise OperatorResolutionError(
+                "RESOLUTION_NOT_VERIFIED",
+                f"{entity_type} {target} was not created by this operation.",
+            )
+        verification = self._read_back(
+            run_id=execution.run_id,
+            execution_id=execution.execution_id,
+            entity_type=entity_type,
+            entity_id=target,
+            expected_state=expected_state,
+            now=current_time,
+        )
+        if verification.status is not VerificationStatus.VERIFIED:
+            raise OperatorResolutionError(
+                "RESOLUTION_NOT_VERIFIED",
+                f"Read-back of {entity_type} {target} did not verify: "
+                + "; ".join(verification.mismatches),
+            )
+        data = dict(verification.actual_state)
+        succeeded = execution.model_copy(
+            update={
+                **history,
+                "status": ToolExecutionStatus.SUCCEEDED,
+                "result": data,
+                "error_code": None,
+                "error_message": None,
+                "resolution": "OPERATOR_CONFIRMED_SUCCESS",
+            }
+        )
+        self._repositories.tool_executions.save(execution=succeeded)
+        return ExecutionOutcome(
+            success=True,
+            execution=succeeded,
+            verification=verification,
+            tool_result=ToolResult(success=True, data=data),
+            message=(
+                f"Operator resolution verified by read-back: "
+                f"{self._derive_success_message(execution.tool_name, data)}"
+            ),
+        )
+
+    def _record_idempotency_key(self, entity_type: str, entity_id: UUID) -> str | None:
+        repos = self._repositories
+        record: Any
+        if entity_type == "order":
+            record = repos.orders.get_by_id(order_id=entity_id)
+        elif entity_type == "invoice":
+            record = repos.invoices.get_by_id(invoice_id=entity_id)
+        elif entity_type == "dispatch":
+            record = repos.dispatches.get_by_id(dispatch_id=entity_id)
+        else:
+            record = None
+        return record.idempotency_key if record is not None else None
+
     def _committed_entity_id(self, tool_name: str, idempotency_key: str) -> UUID | None:
         """Find the record a write created under this idempotency key, if any."""
-        repos = self._repositories
-        if tool_name == "create_order":
-            order = repos.orders.get_by_idempotency_key(idempotency_key=idempotency_key)
-            return order.order_id if order else None
-        if tool_name == "create_invoice_draft":
-            invoice = repos.invoices.get_by_idempotency_key(idempotency_key=idempotency_key)
-            return invoice.invoice_id if invoice else None
-        if tool_name == "dispatch_order":
-            dispatch = repos.dispatches.get_by_idempotency_key(idempotency_key=idempotency_key)
-            return dispatch.dispatch_id if dispatch else None
-        return None
+        return committed_record_id(self._repositories, tool_name, idempotency_key)
 
     def _resolve_unknown(
         self,
@@ -531,6 +713,8 @@ class ExecutionService:
                 "completed_at": now,
                 # The record keeps that this outcome was once UNKNOWN, and why.
                 "reconciled": True,
+                "resolution": "RECONCILED_BY_READ_BACK",
+                "resolved_at": now,
                 "prior_status": execution.status,
                 "prior_error_code": execution.error_code,
                 "prior_error_message": execution.error_message,
@@ -556,22 +740,31 @@ class ExecutionService:
                 f"The invoice could not be created. I have kept the validated draft. (Error: {err})"
             )
         elif tool_name == "dispatch_order":
-            return f"The dispatch could not be executed. Order remains confirmed but not dispatched. (Error: {err})"
+            # State only what is known: no dispatch was recorded. The order's own
+            # status is reported from its record by the caller, never assumed here.
+            return f"The dispatch could not be executed; no dispatch was recorded. (Error: {err})"
         elif tool_name == "create_order":
-            return f"The order could not be created. (Error: {err})"
+            return f"The order could not be created; no order was recorded. (Error: {err})"
+        elif tool_name == "create_invoice_draft":
+            return (
+                f"The invoice draft could not be created; no invoice was recorded. (Error: {err})"
+            )
         return f"Action '{tool_name}' failed: {err}"
 
     def _derive_success_message(self, tool_name: str, data: dict[str, Any]) -> str:
+        # Wording follows the record's actual status (P2-F): a DRAFT is a draft.
+        status = data.get("status")
         if tool_name == "create_order":
-            return f"Order {data.get('order_id')} created successfully."
+            return f"Order {data.get('order_id')} recorded with status {status}."
         elif tool_name == "create_invoice_draft":
             return (
-                f"Invoice draft {data.get('invoice_id')} generated for total ₹{data.get('total')}."
+                f"Invoice {data.get('invoice_id')} recorded with status {status} "
+                f"(total ₹{data.get('total')}); it has not been issued."
             )
         elif tool_name == "issue_invoice":
             return f"Invoice {data.get('invoice_id')} issued successfully for total ₹{data.get('total')}."
         elif tool_name == "dispatch_order":
-            return f"Dispatch {data.get('dispatch_id')} confirmed with warehouse."
+            return f"Dispatch {data.get('dispatch_id')} recorded with status {status}."
         return f"Tool '{tool_name}' completed successfully."
 
     def _infer_entity_type(self, tool_name: str) -> str:

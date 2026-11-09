@@ -27,6 +27,7 @@ from pydantic import Field
 
 from vaaniflow.context.models.business_context import BusinessContext
 from vaaniflow.domain.models.tax import TaxCalculation
+from vaaniflow.domain.models.validation import ValidationResult
 from vaaniflow.domain.schemas.common import DomainSchema
 from vaaniflow.domain.schemas.semantic import RequestedActionType, SemanticState
 from vaaniflow.domain.schemas.understand import UnderstandResult
@@ -38,6 +39,19 @@ ACTION_TOOLS: dict[RequestedActionType, tuple[str, ...]] = {
     RequestedActionType.CREATE_INVOICE_DRAFT: ("create_order", "create_invoice_draft"),
 }
 TOOL_ORDER: tuple[str, ...] = ("create_order", "create_invoice_draft", "dispatch_order")
+
+# Read-back verification contract for every state-changing tool (P2-G): the
+# business record type the verifier reads back. A write tool without a contract
+# can never be planned: its success could not be verified.
+VERIFICATION_CONTRACTS: dict[str, str] = {
+    "create_order": "order",
+    "create_invoice_draft": "invoice",
+    "dispatch_order": "dispatch",
+}
+# Registered write tools that are deliberately not plannable, and why.
+UNPLANNABLE_WRITE_TOOLS: dict[str, str] = {
+    "issue_invoice": "No read-back contract: an issued invoice is not verified yet.",
+}
 
 # Answered from already-resolved business context; no side effects.
 READ_ACTIONS = frozenset({RequestedActionType.CHECK_PRICE, RequestedActionType.CHECK_INVENTORY})
@@ -81,12 +95,22 @@ class ExecutionPlan(DomainSchema):
 
 
 class PendingExecution(DomainSchema):
-    """A plan awaiting explicit approval, with the UnderstandResult it came from."""
+    """
+    A plan awaiting explicit approval, with what it was derived from: the
+    UnderstandResult, the resolved business facts, the validation result and
+    the policy reason approval was required for (P2-E audit linkage).
+    """
 
     approval_id: UUID
     plan: ExecutionPlan
     understand_result: UnderstandResult
     created_at: datetime
+    context_snapshot: dict[str, Any] = Field(default_factory=dict)
+    validation_result: ValidationResult | None = None
+    decision_reason: str | None = None
+    # Validation warnings the user explicitly confirmed before this plan was
+    # built (P2-C); approval re-assessment accepts exactly these, nothing more.
+    confirmed_warning_keys: list[str] = Field(default_factory=list)
 
 
 class StepStatus(StrEnum):
@@ -147,7 +171,7 @@ def expected_state_for(tool_name: str, arguments: dict[str, Any]) -> dict[str, A
             "delivery_address": arguments["delivery_address"],
             "status": "DISPATCHED",
         }
-    raise PlanningError(f"No read-back contract is defined for tool '{tool_name}'.")
+    raise PlanningError(f"No read-back verification contract is defined for tool '{tool_name}'.")
 
 
 def split_actions(
@@ -230,6 +254,12 @@ def build_plan(
         if a not in ACTION_TOOLS and a not in READ_ACTIONS and a not in APPROVAL_ACTIONS
     ]
     tools = {tool for action in executable for tool in ACTION_TOOLS.get(action, ())}
+    unverifiable = sorted(t for t in tools if t not in VERIFICATION_CONTRACTS)
+    if unverifiable:
+        raise PlanningError(
+            f"No read-back verification contract for {', '.join(unverifiable)}; "
+            "its outcome could not be verified, so it is not planned."
+        )
     tool_calls = _tool_calls(
         tools=[t for t in TOOL_ORDER if t in tools],
         executable=executable,

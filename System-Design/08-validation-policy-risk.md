@@ -88,6 +88,28 @@ Example:
 | Policy violation | BLOCKED |
 | Tool failure | FAILED / PRESERVE STATE |
 
+### Implemented matrix (`policy/engine.py`, `application/services/orchestrator.py`)
+
+Evaluated in order; the first matching rule decides.
+
+| # | Condition | Decision |
+|---|---|---|
+| 0 | Any negated action | CLARIFY |
+| 1 | Customer or product identity failed | CLARIFY |
+| 1b | Referenced rate has no matching quote (`QUOTE_REFERENCE`) | CLARIFY |
+| 2 | Quantity-magnitude or spoken-price warning not yet confirmed | CONFIRM |
+| 3 | Quote not applicable, stock shortage, or spoken price without a quote (`PRICE_AUTHORITY`) | HUMAN_HANDOFF |
+| 4 | Any other failed check | BLOCKED |
+| 5 | Consequential action (dispatch, invoice, approval request, high risk) | APPROVAL_REQUIRED (EXECUTE only inside an approved re-assessment) |
+| 6 | Otherwise | EXECUTE (read-only answers) |
+
+After the policy: a plan that cannot be built safely → BLOCKED; an equivalent order
+already exists → BLOCKED (`DUPLICATE_ORDER`); the duplicate check cannot run →
+HUMAN_HANDOFF. CONFIRM creates a confirmation bound to the run, the exact warning keys
+(`check_type|field|expected|actual`) and the business snapshot; a "yes" makes rule 2
+accept exactly those keys on the next assessment, and approval is still required.
+Approval re-assessment uses the same confirmed keys; any changed fact expires it.
+
 ## 8.6 Explainability
 
 Every decision should have machine-readable reasons.

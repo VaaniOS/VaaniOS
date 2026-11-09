@@ -60,6 +60,12 @@ Stage failures raise typed port errors (`ArtifactStorageError`,
    calibrated probabilities; treat them as evidence, never as permission.
 6. Never execute anything listed in `negated_actions`, and never pick one
    candidate from an ambiguity's `candidates` on the user's behalf.
+7. A historical price is anchored through the links, not by position:
+   `pricing[].reference_id` → `references[].temporal_expression_id` →
+   `temporal_expressions[]`. ACT resolves that expression against the transcript's
+   `created_at` (when the user spoke) and only matches quotes given on that date
+   (System-Design 06 §6.6). A temporal expression with no such link (e.g. an
+   execution date, `target = EXECUTION`) never constrains quote selection.
 
 ## Known limitations
 

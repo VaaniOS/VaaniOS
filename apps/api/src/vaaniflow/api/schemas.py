@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -28,6 +29,29 @@ class ProcessRunRequest(BaseModel):
     text: str | None = None
 
 
+class ConfirmationView(BaseModel):
+    confirmation_id: UUID
+    status: str
+    prompt: str
+    warnings: list[str] = Field(default_factory=list)
+
+
+class ClarificationView(BaseModel):
+    """What was understood and what is missing; the next turn continues from this."""
+
+    clarification_id: UUID
+    reason_code: str
+    reason: str
+    unresolved: list[dict[str, Any]] = Field(default_factory=list)
+    understood: dict[str, Any] = Field(default_factory=dict)
+
+
+class DuplicateView(BaseModel):
+    status: str
+    reason: str
+    duplicate_order_ids: list[UUID] = Field(default_factory=list)
+
+
 class WorkflowResponse(BaseModel):
     run_id: UUID
     status: VoiceRunStatus
@@ -49,6 +73,11 @@ class WorkflowResponse(BaseModel):
     # Per-tool evidence for an executed plan: VERIFIED / FAILED / UNKNOWN / NOT_ATTEMPTED.
     tool_outcomes: list[StepOutcome] = Field(default_factory=list)
     superseded_approval_ids: list[UUID] = Field(default_factory=list)
+    superseded_confirmation_ids: list[UUID] = Field(default_factory=list)
+    superseded_clarification_ids: list[UUID] = Field(default_factory=list)
+    confirmation: ConfirmationView | None = None
+    clarification: ClarificationView | None = None
+    duplicate_check: DuplicateView | None = None
 
 
 class ApproveRequest(BaseModel):
@@ -57,6 +86,7 @@ class ApproveRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     approval_id: UUID
+    # Recorded for audit only; identity is not authentication and grants nothing.
     approved_by: UUID | None = None
 
 
@@ -65,10 +95,44 @@ class RejectRequest(BaseModel):
 
     approval_id: UUID
     rejected_by: UUID | None = None
+    reason: str | None = None
 
 
 class ClarifyRequest(BaseModel):
+    """A new instruction for the run; it supersedes anything pending on it."""
+
+    model_config = ConfigDict(extra="forbid")
+
     clarification: str = Field(min_length=1)
+
+
+class ConfirmRequest(BaseModel):
+    """
+    A yes/no reply to the confirmation pending on this run. Without an id it
+    answers the run's single pending confirmation; it never approves anything.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    reply: str = Field(min_length=1)
+    confirmation_id: UUID | None = None
+    confirmed_by: UUID | None = None
+
+
+class ResolveUnknownRequest(BaseModel):
+    """
+    Operator resolution of one UNKNOWN execution. ``attempt`` must match the
+    execution's current attempt. SUCCEEDED is accepted only if read-back verifies
+    a record committed by this operation; ``resolved_by`` is recorded, not trusted.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    attempt: int = Field(ge=1)
+    outcome: Literal["SUCCEEDED", "FAILED"]
+    reason: str = Field(min_length=1)
+    resolved_by: UUID | None = None
+    entity_id: UUID | None = None
 
 
 class ManualHandoffRequest(BaseModel):

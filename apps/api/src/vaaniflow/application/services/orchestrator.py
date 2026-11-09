@@ -13,9 +13,15 @@ from vaaniflow.application.services.transcribe_audio import TranscribeAudioServi
 from vaaniflow.context.models.business_context import BusinessContext
 from vaaniflow.context.service import ContextResolutionOutput, ContextResolutionService
 from vaaniflow.domain.models.approval import Approval, ApprovalStatus
+from vaaniflow.domain.models.followup import (
+    ClarificationRecord,
+    ClarificationStatus,
+    ConfirmationStatus,
+    PendingConfirmation,
+)
 from vaaniflow.domain.models.handoff import HandoffCase
 from vaaniflow.domain.models.tool_execution import ToolExecutionStatus
-from vaaniflow.domain.models.validation import ValidationResult
+from vaaniflow.domain.models.validation import ValidationResult, ValidationStatus
 from vaaniflow.domain.models.verification import VerificationStatus
 from vaaniflow.domain.models.voice_run import VoiceRun, VoiceRunStatus
 from vaaniflow.domain.policies.decision import Decision, DecisionReasonCode, DecisionType
@@ -26,6 +32,7 @@ from vaaniflow.domain.schemas.semantic import ReferenceType, SemanticState
 from vaaniflow.domain.schemas.transcript import Transcript
 from vaaniflow.domain.schemas.understand import EvaluationReasonCode, UnderstandResult
 from vaaniflow.execution.approval import ApprovalService
+from vaaniflow.execution.duplicates import DuplicateCheck, DuplicateStatus, check_duplicate_order
 from vaaniflow.execution.plan import (
     ExecutionPlan,
     PendingExecution,
@@ -36,10 +43,15 @@ from vaaniflow.execution.plan import (
     business_snapshot_version,
     expected_state_for,
 )
-from vaaniflow.execution.service import ExecutionOutcome, ExecutionService
-from vaaniflow.handoff.service import HandoffService
+from vaaniflow.execution.service import (
+    ExecutionOutcome,
+    ExecutionService,
+    OperatorResolutionError,
+)
+from vaaniflow.handoff.service import HandoffService, interpret_semantic_state
 from vaaniflow.infrastructure.repositories.synthetic_data import SyntheticRepositories
-from vaaniflow.policy.engine import PolicyEngine
+from vaaniflow.policy.confirmation import ReplyIntent, classify_reply
+from vaaniflow.policy.engine import PolicyEngine, confirmable_warnings, warning_key
 from vaaniflow.policy.risk import RiskAssessor
 from vaaniflow.semantic.compiler import SemanticCompiler
 from vaaniflow.semantic.evaluation import InputEvaluator
@@ -67,6 +79,10 @@ class ApprovalFlowError(Exception):
         self.message = message
 
 
+class ConfirmationFlowError(ApprovalFlowError):
+    """A confirmation reply does not refer to a pending confirmation of this run."""
+
+
 @dataclass
 class WorkflowResult:
     """Standardized composite result returned after processing a voice run."""
@@ -88,6 +104,12 @@ class WorkflowResult:
     step_outcomes: list[StepOutcome] = field(default_factory=list)
     # Earlier pending approvals of this run that this instruction superseded.
     superseded_approval_ids: list[UUID] = field(default_factory=list)
+    superseded_confirmation_ids: list[UUID] = field(default_factory=list)
+    superseded_clarification_ids: list[UUID] = field(default_factory=list)
+    # Follow-up records the next turn or an operator continues from (P2-C, P2-J).
+    confirmation: PendingConfirmation | None = None
+    clarification: ClarificationRecord | None = None
+    duplicate_check: DuplicateCheck | None = None
 
     @property
     def all_steps_verified(self) -> bool | None:
@@ -200,12 +222,45 @@ class VoiceWorkflowOrchestrator:
         self._set_status(run, VoiceRunStatus.PROCESSING, t)
 
         # 0. A new instruction on this run replaces any plan still awaiting
-        #    approval: at most one executable REQUESTED approval per run.
+        #    approval, any confirmation still awaiting a reply and any open
+        #    clarification: at most one executable REQUESTED approval per run.
         superseded = self._supersede_pending_approvals(run, now=t)
+        superseded_confirmations = self._supersede_pending_confirmations(run, now=t)
+        superseded_clarifications = self._supersede_open_clarifications(run, now=t)
 
         result = self._process(text=text, run=run, now=t)
         result.superseded_approval_ids = superseded
+        result.superseded_confirmation_ids = superseded_confirmations
+        result.superseded_clarification_ids = superseded_clarifications
+        self._link_supersessions(result)
         return result
+
+    def _link_supersessions(self, result: WorkflowResult) -> None:
+        """Record on each superseded follow-up what replaced it (P2-B audit)."""
+        new_approval = result.approval.approval_id if result.approval else None
+        for approval_id in result.superseded_approval_ids:
+            approval = self.repositories.approvals.get_by_id(approval_id=approval_id)
+            if approval is not None and new_approval is not None:
+                approval.superseded_by = new_approval
+                self.repositories.approvals.save(approval=approval)
+        new_confirmation = result.confirmation.confirmation_id if result.confirmation else None
+        for confirmation_id in result.superseded_confirmation_ids:
+            confirmation = self.repositories.pending_confirmations.get_by_id(
+                confirmation_id=confirmation_id
+            )
+            if confirmation is not None and new_confirmation is not None:
+                confirmation.superseded_by = new_confirmation
+                self.repositories.pending_confirmations.save(confirmation=confirmation)
+        transcript_id = (
+            result.understand_result.transcript.transcript_id if result.understand_result else None
+        )
+        for clarification_id in result.superseded_clarification_ids:
+            clarification = self.repositories.clarifications.get_by_id(
+                clarification_id=clarification_id
+            )
+            if clarification is not None:
+                clarification.superseded_by_transcript_id = transcript_id
+                self.repositories.clarifications.save(clarification=clarification)
 
     def _process(self, *, text: str, run: VoiceRun, now: datetime) -> WorkflowResult:
         t = now
@@ -278,25 +333,57 @@ class VoiceWorkflowOrchestrator:
                 now=t,
             )
 
+        return self._act(run, understand_result, now=t)
+
+    def _act(
+        self,
+        run: VoiceRun,
+        understand_result: UnderstandResult,
+        *,
+        now: datetime,
+        utterance_time: datetime | None = None,
+        confirmed_warning_keys: frozenset[str] = frozenset(),
+    ) -> WorkflowResult:
+        """
+        ACT for an UnderstandResult that passed the UNDERSTAND gates: context,
+        validation, risk, policy, plan, duplicate check, approval request.
+
+        Never executes a write. ``confirmed_warning_keys`` are the validation
+        warnings the user explicitly confirmed (P2-C); approval is still required.
+        """
+        t = now
+        semantic_state = understand_result.semantic_state
+        evaluation = understand_result.evaluation
+
         # 3–6. Context → validation → risk → policy
-        act = self._assess(semantic_state=semantic_state, run=run, is_approved=False, now=t)
+        act = self._assess(
+            semantic_state=semantic_state,
+            run=run,
+            is_approved=False,
+            now=t,
+            utterance_time=utterance_time,
+            confirmed_warning_keys=confirmed_warning_keys,
+        )
         decision = act.decision
 
         if decision.decision is DecisionType.CLARIFY:
-            self._set_status(run, VoiceRunStatus.CLARIFICATION_REQUIRED, t)
-            return self._result(run, understand_result, act=act, message=decision.reason)
+            return self._clarify(
+                run,
+                understand_result,
+                code=decision.reason_code,
+                reason=decision.reason,
+                act=act,
+                now=t,
+            )
 
         if decision.decision is DecisionType.CONFIRM:
-            self._set_status(run, VoiceRunStatus.APPROVAL_REQUIRED, t)
-            return self._result(
-                run, understand_result, act=act, message=f"Confirmation required: {decision.reason}"
-            )
+            return self._request_confirmation(run, understand_result, act=act, now=t)
 
         if decision.decision is DecisionType.HUMAN_HANDOFF:
             self._set_status(run, VoiceRunStatus.HANDOFF, t)
             handoff_case = self.handoff_service.create_case_from_evaluation(
                 run_id=run.run_id,
-                original_request=text,
+                original_request=understand_result.transcript.text,
                 validation_result=act.validation,
                 risk_assessment=act.risk,
                 decision=decision,
@@ -377,11 +464,21 @@ class VoiceWorkflowOrchestrator:
         if not plan.has_writes:
             return self._finish_without_writes(run, understand_result, act=act, plan=plan, now=t)
 
+        # 7b. A business-level duplicate of an existing order is never re-created.
+        duplicate = check_duplicate_order(plan=plan, repositories=self.repositories, now=t)
+        self._trace_duplicate_check(run, duplicate, plan, now=t)
+        if duplicate.status is not DuplicateStatus.NO_DUPLICATE:
+            return self._refuse_duplicate(
+                run, understand_result, act=act, plan=plan, duplicate=duplicate, now=t
+            )
+
         # 8. Business writes always require an approval bound to this exact plan.
+        #    The request comes from the system; no requester identity is invented.
         approval = self.approval_service.request_approval(
             run_id=run.run_id,
-            requested_by=uuid4(),
             snapshot_version=plan.snapshot_version,
+            plan_id=plan.plan_id,
+            plan_fingerprint=plan.fingerprint,
             now=t,
         )
         self.repositories.pending_executions.save(
@@ -390,6 +487,10 @@ class VoiceWorkflowOrchestrator:
                 plan=plan,
                 understand_result=understand_result,
                 created_at=t,
+                context_snapshot=act.context.snapshot,
+                validation_result=act.validation,
+                decision_reason=decision.reason,
+                confirmed_warning_keys=sorted(confirmed_warning_keys),
             )
         )
         approval_decision = Decision(
@@ -432,10 +533,11 @@ class VoiceWorkflowOrchestrator:
             approval=approval,
             handoff_case=None,
             execution_outcome=None,
-            message=f"Approval required for planned actions: {', '.join(plan.tool_names)}."
-            + unsupported,
+            message=f"Approval required for planned actions: {', '.join(plan.tool_names)}. "
+            "Nothing has been executed." + unsupported,
             snapshot_version=plan.snapshot_version,
             plan=plan,
+            duplicate_check=duplicate,
         )
 
     # ------------------------------------------------------------------ #
@@ -447,7 +549,7 @@ class VoiceWorkflowOrchestrator:
         *,
         run_id: UUID,
         approval_id: UUID,
-        approved_by: UUID,
+        approved_by: UUID | None = None,
         simulated_faults: dict[str, Any] | None = None,
         now: datetime | None = None,
     ) -> WorkflowResult:
@@ -469,6 +571,7 @@ class VoiceWorkflowOrchestrator:
             is_approved=True,
             now=t,
             utterance_time=understand_result.transcript.created_at,
+            confirmed_warning_keys=frozenset(pending.confirmed_warning_keys),
         )
         try:
             current_plan = build_plan(
@@ -492,10 +595,36 @@ class VoiceWorkflowOrchestrator:
         elif current_plan.snapshot_version != approval.snapshot_version:
             stale_reason = "business state changed since approval was requested"
 
+        # Duplicate check again at the execution boundary: another run may have
+        # created the equivalent order after this approval was requested.
+        duplicate: DuplicateCheck | None = None
+        if stale_reason is None:
+            duplicate = check_duplicate_order(plan=plan, repositories=self.repositories, now=t)
+            self._trace_duplicate_check(run, duplicate, plan, now=t)
+            if duplicate.status is not DuplicateStatus.NO_DUPLICATE:
+                approval = self.approval_service.expire(
+                    approval_id=approval.approval_id,
+                    reason=duplicate.reason,
+                    observed_snapshot_version=act.snapshot_version,
+                    now=t,
+                )
+                return self._refuse_duplicate(
+                    run,
+                    understand_result,
+                    act=act,
+                    plan=plan,
+                    duplicate=duplicate,
+                    approval=approval,
+                    now=t,
+                )
+
         if stale_reason is not None:
-            approval.status = ApprovalStatus.EXPIRED
-            approval.resolved_at = t
-            self.repositories.approvals.save(approval=approval)
+            approval = self.approval_service.expire(
+                approval_id=approval.approval_id,
+                reason=stale_reason,
+                observed_snapshot_version=act.snapshot_version,
+                now=t,
+            )
             run.failure_code = "APPROVAL_EXPIRED"
             run.failure_message = f"Approval expired: {stale_reason}. Nothing was executed."
             self._set_status(run, VoiceRunStatus.FAILED, t)
@@ -515,10 +644,11 @@ class VoiceWorkflowOrchestrator:
                 message=run.failure_message,
             )
 
+        # The snapshot recomputed now (equal to the plan's, or it would have expired).
         approval = self.approval_service.approve(
             approval_id=approval.approval_id,
             approved_by=approved_by,
-            current_snapshot_version=plan.snapshot_version,
+            current_snapshot_version=act.snapshot_version,
             now=t,
         )
         self.trace_service.record_stage(
@@ -528,7 +658,7 @@ class VoiceWorkflowOrchestrator:
             timestamp=t,
         )
         self._set_status(run, VoiceRunStatus.EXECUTING, t)
-        return self._execute_plan(
+        result = self._execute_plan(
             run,
             understand_result,
             act=act,
@@ -537,20 +667,37 @@ class VoiceWorkflowOrchestrator:
             simulated_faults=simulated_faults or {},
             now=t,
         )
+        result.duplicate_check = duplicate
+        self._link_approval_records(approval, result.step_outcomes)
+        return result
+
+    def _link_approval_records(self, approval: Approval, steps: list[StepOutcome]) -> None:
+        """Point the approval at the verified business records its plan produced."""
+        fields = {
+            "create_order": "order_id",
+            "create_invoice_draft": "invoice_id",
+            "dispatch_order": "dispatch_id",
+        }
+        for step in steps:
+            name = fields.get(step.tool_name)
+            if name and step.status is StepStatus.VERIFIED and step.entity_id:
+                setattr(approval, name, UUID(step.entity_id))
+        self.repositories.approvals.save(approval=approval)
 
     def reject(
         self,
         *,
         run_id: UUID,
         approval_id: UUID,
-        rejected_by: UUID,
+        rejected_by: UUID | None = None,
+        reason: str | None = None,
         now: datetime | None = None,
     ) -> WorkflowResult:
         """Reject a pending approval of this run. Its plan can never execute."""
         t = now or self.clock()
         run, pending, approval = self._pending_approval(run_id=run_id, approval_id=approval_id)
         approval = self.approval_service.reject(
-            approval_id=approval.approval_id, rejected_by=rejected_by, now=t
+            approval_id=approval.approval_id, rejected_by=rejected_by, reason=reason, now=t
         )
         run.failure_code = "APPROVAL_REJECTED"
         run.failure_message = "The owner rejected the planned actions. Nothing was executed."
@@ -568,6 +715,504 @@ class VoiceWorkflowOrchestrator:
             plan=pending.plan,
             message=run.failure_message,
         )
+
+    # ------------------------------------------------------------------ #
+    # Confirmation (P2-C)
+    # ------------------------------------------------------------------ #
+
+    def confirm(
+        self,
+        *,
+        run_id: UUID,
+        reply: str,
+        confirmation_id: UUID | None = None,
+        confirmed_by: UUID | None = None,
+        now: datetime | None = None,
+    ) -> WorkflowResult:
+        """
+        Answer the confirmation pending on this run.
+
+        A reply only ever answers a confirmation of *this* run that is still
+        REQUESTED. "Yes" accepts exactly the warnings it was asked about, on the
+        business snapshot it was asked with; if the facts changed it expires.
+        Confirmation never executes anything: writes still need approval.
+        """
+        t = now or self.clock()
+        run = self.repositories.runs.get_by_id(run_id=run_id)
+        if run is None:
+            raise ConfirmationFlowError("RUN_NOT_FOUND", f"Run {run_id} not found.")
+        confirmation = self._pending_confirmation(run, confirmation_id)
+        if confirmation is None:
+            return WorkflowResult(
+                run=run,
+                understand_result=None,
+                business_context=None,
+                validation_result=None,
+                risk_assessment=None,
+                decision=Decision(
+                    decision_id=uuid4(),
+                    run_id=run.run_id,
+                    decision=DecisionType.CLARIFY,
+                    reason_code=DecisionReasonCode.MISSING_INFORMATION,
+                    reason="Nothing on this run is awaiting confirmation.",
+                    allowed=False,
+                    policy_version=PolicyEngine.VERSION,
+                ),
+                approval=None,
+                handoff_case=None,
+                execution_outcome=None,
+                message="Nothing on this run is awaiting confirmation; nothing was changed.",
+            )
+
+        understand_result = confirmation.understand_result
+        intent = classify_reply(reply)
+        if intent is ReplyIntent.UNCLEAR:
+            result = self._result(
+                run,
+                understand_result,
+                decision=Decision(
+                    decision_id=uuid4(),
+                    run_id=run.run_id,
+                    decision=DecisionType.CLARIFY,
+                    reason_code=DecisionReasonCode.AMBIGUOUS_INPUT,
+                    reason="The reply was not a clear yes or no.",
+                    allowed=False,
+                    policy_version=PolicyEngine.VERSION,
+                ),
+                message=(
+                    f"The reply was not understood as yes or no; confirmation "
+                    f"{confirmation.confirmation_id} is still pending. Nothing was changed."
+                ),
+            )
+            result.confirmation = confirmation
+            return result
+
+        confirmation.reply_text = reply
+        confirmation.confirmed_by = confirmed_by
+        confirmation.resolved_at = t
+        if intent is ReplyIntent.DECLINE:
+            confirmation.status = ConfirmationStatus.DECLINED
+            confirmation.resolution_reason = "The user declined."
+            self.repositories.pending_confirmations.save(confirmation=confirmation)
+            run.failure_code = "CONFIRMATION_DECLINED"
+            run.failure_message = "Not confirmed. Nothing was planned or executed."
+            self._set_status(run, VoiceRunStatus.BLOCKED, t)
+            self._trace_confirmation(run, confirmation, now=t)
+            result = self._result(run, understand_result, message=run.failure_message)
+            result.confirmation = confirmation
+            return result
+
+        utterance_time = understand_result.transcript.created_at
+        current = self._assess(
+            semantic_state=understand_result.semantic_state,
+            run=run,
+            is_approved=False,
+            now=t,
+            utterance_time=utterance_time,
+            confirmed_warning_keys=frozenset(confirmation.warning_keys),
+        )
+        if current.snapshot_version != confirmation.snapshot_version:
+            # The user confirmed facts that no longer hold: re-evaluate from scratch.
+            confirmation.status = ConfirmationStatus.EXPIRED
+            confirmation.resolution_reason = (
+                "Business state changed after the confirmation was requested; "
+                "the confirmed interpretation no longer applies."
+            )
+            self.repositories.pending_confirmations.save(confirmation=confirmation)
+            self._trace_confirmation(run, confirmation, now=t)
+            result = self._act(run, understand_result, now=t, utterance_time=utterance_time)
+            result.superseded_confirmation_ids = [confirmation.confirmation_id]
+            result.message = f"{confirmation.resolution_reason} {result.message}"
+            return result
+
+        confirmation.status = ConfirmationStatus.CONFIRMED
+        confirmation.resolution_reason = "The user confirmed the interpretation."
+        self.repositories.pending_confirmations.save(confirmation=confirmation)
+        self._trace_confirmation(run, confirmation, now=t)
+        return self._act(
+            run,
+            understand_result,
+            now=t,
+            utterance_time=utterance_time,
+            confirmed_warning_keys=frozenset(confirmation.warning_keys),
+        )
+
+    def _pending_confirmation(
+        self, run: VoiceRun, confirmation_id: UUID | None
+    ) -> PendingConfirmation | None:
+        if confirmation_id is None:
+            pending = [
+                c
+                for c in self.repositories.pending_confirmations.list_by_run(run_id=run.run_id)
+                if c.status is ConfirmationStatus.REQUESTED
+            ]
+            return pending[0] if pending else None
+        confirmation = self.repositories.pending_confirmations.get_by_id(
+            confirmation_id=confirmation_id
+        )
+        if confirmation is None:
+            raise ConfirmationFlowError(
+                "CONFIRMATION_NOT_FOUND", f"Confirmation {confirmation_id} not found."
+            )
+        if confirmation.run_id != run.run_id:
+            raise ConfirmationFlowError(
+                "CONFIRMATION_RUN_MISMATCH",
+                f"Confirmation {confirmation_id} does not belong to run {run.run_id}.",
+            )
+        if confirmation.status is ConfirmationStatus.SUPERSEDED:
+            raise ConfirmationFlowError(
+                "CONFIRMATION_SUPERSEDED",
+                f"Confirmation {confirmation_id} was superseded by a newer instruction.",
+            )
+        if confirmation.status is not ConfirmationStatus.REQUESTED:
+            raise ConfirmationFlowError(
+                "CONFIRMATION_NOT_PENDING",
+                f"Confirmation {confirmation_id} is {confirmation.status.value}, not pending.",
+            )
+        return confirmation
+
+    def _request_confirmation(
+        self,
+        run: VoiceRun,
+        understand_result: UnderstandResult,
+        *,
+        act: _ActAssessment,
+        now: datetime,
+    ) -> WorkflowResult:
+        warnings = confirmable_warnings(act.validation)
+        context = act.context.business_context
+        state = understand_result.semantic_state
+        item = state.items[0] if len(state.items) == 1 else None
+        understood = []
+        if context.customer:
+            understood.append(context.customer.customer.name)
+        if item and item.quantity:
+            understood.append(f"{item.quantity.value} {item.quantity.unit or ''}".strip())
+        if len(context.products) == 1:
+            understood.append(context.products[0].product.name)
+        if context.resolved_price:
+            price = context.resolved_price
+            understood.append(f"at the quoted {price.unit_price} {price.currency}/{price.unit}")
+        prompt = (
+            f"I understood: {' · '.join(understood) or 'the request'}. "
+            + " ".join(w.message for w in warnings)
+            + " Confirm? (yes/no)"
+        )
+        confirmation = PendingConfirmation(
+            confirmation_id=uuid4(),
+            run_id=run.run_id,
+            status=ConfirmationStatus.REQUESTED,
+            warning_keys=sorted(warning_key(w) for w in warnings),
+            warnings=[w.message for w in warnings],
+            prompt=prompt,
+            snapshot_version=act.snapshot_version,
+            understand_result=understand_result,
+            created_at=now,
+        )
+        self.repositories.pending_confirmations.save(confirmation=confirmation)
+        self._set_status(run, VoiceRunStatus.CONFIRMATION_REQUIRED, now)
+        self.trace_service.record_stage(
+            run_id=run.run_id,
+            stage=TraceStage.CONFIRMATION_REQUESTED,
+            output_summary=f"Confirmation {confirmation.confirmation_id}: {prompt}",
+            timestamp=now,
+        )
+        result = self._result(
+            run,
+            understand_result,
+            act=act,
+            message=(
+                f"Confirmation required: {act.decision.reason} {prompt} "
+                "Nothing has been planned or executed."
+            ),
+        )
+        result.confirmation = confirmation
+        return result
+
+    def _trace_confirmation(
+        self, run: VoiceRun, confirmation: PendingConfirmation, *, now: datetime
+    ) -> None:
+        self.trace_service.record_stage(
+            run_id=run.run_id,
+            stage=TraceStage.CONFIRMATION_RESOLVED,
+            output_summary=(
+                f"Confirmation {confirmation.confirmation_id} {confirmation.status.value}: "
+                f"{confirmation.resolution_reason}"
+            ),
+            timestamp=now,
+        )
+
+    def _supersede_pending_confirmations(self, run: VoiceRun, *, now: datetime) -> list[UUID]:
+        superseded: list[UUID] = []
+        for confirmation in self.repositories.pending_confirmations.list_by_run(run_id=run.run_id):
+            if confirmation.status is not ConfirmationStatus.REQUESTED:
+                continue
+            confirmation.status = ConfirmationStatus.SUPERSEDED
+            confirmation.resolved_at = now
+            confirmation.resolution_reason = "Superseded by a new instruction on this run."
+            self.repositories.pending_confirmations.save(confirmation=confirmation)
+            superseded.append(confirmation.confirmation_id)
+            self._trace_confirmation(run, confirmation, now=now)
+        return superseded
+
+    def _supersede_open_clarifications(self, run: VoiceRun, *, now: datetime) -> list[UUID]:
+        superseded: list[UUID] = []
+        for clarification in self.repositories.clarifications.list_by_run(run_id=run.run_id):
+            if clarification.status is not ClarificationStatus.OPEN:
+                continue
+            clarification.status = ClarificationStatus.SUPERSEDED
+            clarification.resolved_at = now
+            self.repositories.clarifications.save(clarification=clarification)
+            superseded.append(clarification.clarification_id)
+        return superseded
+
+    # ------------------------------------------------------------------ #
+    # Duplicate business orders (P2-A)
+    # ------------------------------------------------------------------ #
+
+    def _trace_duplicate_check(
+        self, run: VoiceRun, check: DuplicateCheck, plan: ExecutionPlan, *, now: datetime
+    ) -> None:
+        self.trace_service.record_stage(
+            run_id=run.run_id,
+            stage=TraceStage.DUPLICATE_CHECKED,
+            output_summary=f"Plan {plan.plan_id}: {check.status.value} — {check.reason}",
+            metadata={
+                "duplicate_order_ids": [str(i) for i in check.duplicate_order_ids],
+                "business_key": check.business_key,
+            },
+            timestamp=now,
+        )
+
+    def _refuse_duplicate(
+        self,
+        run: VoiceRun,
+        understand_result: UnderstandResult,
+        *,
+        act: _ActAssessment,
+        plan: ExecutionPlan,
+        duplicate: DuplicateCheck,
+        now: datetime,
+        approval: Approval | None = None,
+    ) -> WorkflowResult:
+        handoff_case: HandoffCase | None = None
+        if duplicate.status is DuplicateStatus.DUPLICATE_CHECK_UNAVAILABLE:
+            run.failure_code = "DUPLICATE_CHECK_UNAVAILABLE"
+            reason = f"Cannot rule out a duplicate order: {duplicate.reason} No order was created."
+            decision_type = DecisionType.HUMAN_HANDOFF
+            status = VoiceRunStatus.HANDOFF
+            handoff_case = self.handoff_service.create_case(
+                run_id=run.run_id,
+                reason=reason,
+                original_request=understand_result.transcript.text,
+                interpreted_request=interpret_semantic_state(understand_result.semantic_state),
+                blocked_actions=plan.tool_names,
+                recommended_action="Check existing orders for this customer before re-approving.",
+                now=now,
+            )
+        else:
+            run.failure_code = "DUPLICATE_ORDER"
+            reason = (
+                f"{duplicate.reason} No new order was created; use the existing order "
+                "or cancel it before placing this one again."
+            )
+            decision_type = DecisionType.BLOCKED
+            status = VoiceRunStatus.BLOCKED
+        run.failure_message = reason
+        self._set_status(run, status, now)
+        self.trace_service.record_stage(
+            run_id=run.run_id,
+            stage=TraceStage.BLOCKED
+            if decision_type is DecisionType.BLOCKED
+            else TraceStage.HANDOFF_CREATED,
+            error_code=run.failure_code,
+            error_message=reason,
+            timestamp=now,
+        )
+        result = self._result(
+            run,
+            understand_result,
+            act=act,
+            decision=Decision(
+                decision_id=uuid4(),
+                run_id=run.run_id,
+                decision=decision_type,
+                reason_code=DecisionReasonCode.DUPLICATE_ORDER,
+                reason=reason,
+                allowed=False,
+                requires_human_handoff=decision_type is DecisionType.HUMAN_HANDOFF,
+                policy_version=PolicyEngine.VERSION,
+            ),
+            approval=approval,
+            handoff_case=handoff_case,
+            plan=plan,
+            message=reason,
+        )
+        result.duplicate_check = duplicate
+        return result
+
+    # ------------------------------------------------------------------ #
+    # Operator resolution of UNKNOWN (P2-D)
+    # ------------------------------------------------------------------ #
+
+    def resolve_unknown(
+        self,
+        *,
+        run_id: UUID,
+        execution_id: UUID,
+        attempt: int,
+        outcome: ToolExecutionStatus,
+        reason: str,
+        resolved_by: UUID | None = None,
+        entity_id: UUID | None = None,
+        now: datetime | None = None,
+    ) -> WorkflowResult:
+        """
+        Record an operator's verified resolution of one UNKNOWN execution and
+        recompute the run from the plan's step evidence. The UNKNOWN history is
+        kept on the execution record; remaining steps are never run here.
+        """
+        t = now or self.clock()
+        run = self.repositories.runs.get_by_id(run_id=run_id)
+        if run is None:
+            raise OperatorResolutionError("RUN_NOT_FOUND", f"Run {run_id} not found.")
+        execution = self.repositories.tool_executions.get_by_id(execution_id=execution_id)
+        if execution is None:
+            raise OperatorResolutionError(
+                "EXECUTION_NOT_FOUND", f"Tool execution {execution_id} not found."
+            )
+        try:
+            expected_state = expected_state_for(execution.tool_name, execution.arguments)
+        except PlanningError as exc:
+            raise OperatorResolutionError("NO_VERIFICATION_CONTRACT", str(exc)) from exc
+
+        resolved = self.execution_service.resolve_unknown_by_operator(
+            run_id=run.run_id,
+            execution_id=execution_id,
+            attempt=attempt,
+            outcome=outcome,
+            reason=reason,
+            expected_state=expected_state,
+            entity_id=entity_id,
+            resolved_by=resolved_by,
+            now=t,
+        )
+        self.trace_service.record_stage(
+            run_id=run.run_id,
+            stage=TraceStage.OPERATOR_RESOLVED,
+            tool_name=execution.tool_name,
+            output_summary=(
+                f"Execution {execution_id} ({execution.tool_name}, attempt {attempt}) "
+                f"UNKNOWN → {resolved.execution.status.value} by operator: {reason}"
+            ),
+            timestamp=t,
+        )
+
+        pending = next(
+            (
+                p
+                for p in self.repositories.pending_executions.list_by_run(run_id=run.run_id)
+                if f":plan-{p.plan.plan_id}:" in execution.idempotency_key
+            ),
+            None,
+        )
+        if pending is None:
+            return self._result(run, None, outcome=resolved, message=resolved.message)
+
+        plan = pending.plan
+        steps = self._steps_from_records(run, plan)
+        approval = self.repositories.approvals.get_by_id(approval_id=pending.approval_id)
+        if approval is not None:
+            self._link_approval_records(approval, steps)
+        statuses = {step.status for step in steps}
+        summary = self._step_summary(steps)
+        if StepStatus.UNKNOWN in statuses:
+            run.failure_code = "OUTCOME_UNKNOWN"
+            status = VoiceRunStatus.HANDOFF
+        elif statuses == {StepStatus.VERIFIED}:
+            run.failure_code = None
+            run.failure_message = None
+            status = (
+                VoiceRunStatus.HANDOFF if plan.unsupported_actions else VoiceRunStatus.COMPLETED
+            )
+        elif StepStatus.FAILED in statuses:
+            failed = next(s for s in steps if s.status is StepStatus.FAILED)
+            run.failure_code = failed.error_code
+            status = (
+                VoiceRunStatus.PARTIALLY_COMPLETED
+                if StepStatus.VERIFIED in statuses
+                else VoiceRunStatus.FAILED
+            )
+        else:
+            run.failure_code = "REMAINING_STEPS_NOT_ATTEMPTED"
+            status = VoiceRunStatus.HANDOFF
+        message = f"{resolved.message} {summary}"
+        if status is VoiceRunStatus.HANDOFF and StepStatus.NOT_ATTEMPTED in statuses:
+            # There is no plan continuation: re-sending the request would be refused
+            # as a duplicate of the verified records, so say what is actually true.
+            remaining = ", ".join(
+                s.tool_name for s in steps if s.status is StepStatus.NOT_ATTEMPTED
+            )
+            message += (
+                f" Remaining steps ({remaining}) were not attempted and will not run "
+                "automatically. The verified records stand; a new request for the same "
+                "order would be refused as a duplicate of them, so an operator must "
+                "complete the remaining steps manually."
+            )
+        if run.failure_code:
+            run.failure_message = message
+        self._set_status(run, status, t)
+        return self._result(
+            run,
+            pending.understand_result,
+            approval=approval,
+            plan=plan,
+            outcome=resolved,
+            executed=[s.tool_name for s in steps if s.status is StepStatus.VERIFIED],
+            steps=steps,
+            message=message,
+        )
+
+    def _steps_from_records(self, run: VoiceRun, plan: ExecutionPlan) -> list[StepOutcome]:
+        """Per-step outcome of a plan, read from its persisted tool executions."""
+        steps: list[StepOutcome] = []
+        mapping = {
+            ToolExecutionStatus.SUCCEEDED: StepStatus.VERIFIED,
+            ToolExecutionStatus.FAILED: StepStatus.FAILED,
+            ToolExecutionStatus.UNKNOWN: StepStatus.UNKNOWN,
+        }
+        for tool_name in plan.tool_names:
+            execution = self.repositories.tool_executions.get_by_idempotency_key(
+                idempotency_key=f"run-{run.run_id}:plan-{plan.plan_id}:{tool_name}"
+            )
+            if execution is None or execution.status not in mapping:
+                steps.append(
+                    StepOutcome(
+                        tool_name=tool_name,
+                        status=StepStatus.NOT_ATTEMPTED,
+                        message="Not attempted.",
+                    )
+                )
+                continue
+            verification = self.repositories.verifications.get_by_execution_id(
+                execution_id=execution.execution_id
+            )
+            entity_id = (execution.result or {}).get(_ENTITY_ID_KEY.get(tool_name, ""))
+            steps.append(
+                StepOutcome(
+                    tool_name=tool_name,
+                    status=mapping[execution.status],
+                    execution_status=execution.status.value,
+                    verification_status=verification.status.value if verification else None,
+                    entity_id=str(entity_id) if entity_id else None,
+                    error_code=execution.error_code,
+                    message=execution.resolution_reason
+                    or execution.error_message
+                    or execution.status.value,
+                    reconciled=execution.reconciled,
+                )
+            )
+        return steps
 
     def _supersede_pending_approvals(self, run: VoiceRun, *, now: datetime) -> list[UUID]:
         superseded: list[UUID] = []
@@ -641,7 +1286,7 @@ class VoiceWorkflowOrchestrator:
         executed: list[str] = []
         order_id: str | None = None
         outcome: ExecutionOutcome | None = None
-        stopped: ExecutionOutcome | None = None
+        stopped: StepOutcome | None = None
         metadata = {
             "simulate_invoice_failure": bool(simulated_faults.get("simulate_invoice_failure")),
             "simulate_dispatch_failure": bool(simulated_faults.get("simulate_dispatch_failure")),
@@ -654,7 +1299,7 @@ class VoiceWorkflowOrchestrator:
                     StepOutcome(
                         tool_name=call.tool_name,
                         status=StepStatus.NOT_ATTEMPTED,
-                        message=f"Not attempted: {stopped.execution.tool_name} did not verify.",
+                        message=f"Not attempted: {stopped.tool_name} did not verify.",
                     )
                 )
                 continue
@@ -662,6 +1307,19 @@ class VoiceWorkflowOrchestrator:
             arguments = dict(call.arguments)
             if call.depends_on_order:
                 arguments["order_id"] = order_id
+            try:
+                expected_state = expected_state_for(call.tool_name, arguments)
+            except PlanningError as exc:
+                # No read-back contract (P2-G): the tool is never invoked, so
+                # nothing is written and nothing can be falsely reported.
+                stopped = StepOutcome(
+                    tool_name=call.tool_name,
+                    status=StepStatus.FAILED,
+                    error_code="NO_VERIFICATION_CONTRACT",
+                    message=f"Not executed: {exc}",
+                )
+                steps.append(stopped)
+                continue
 
             outcome = self.execution_service.execute(
                 run_id=run.run_id,
@@ -671,7 +1329,7 @@ class VoiceWorkflowOrchestrator:
                 decision=act.decision,
                 approval=approval,
                 current_snapshot_version=plan.snapshot_version,
-                expected_state=expected_state_for(call.tool_name, arguments),
+                expected_state=expected_state,
                 metadata=metadata,
                 now=now,
             )
@@ -701,7 +1359,7 @@ class VoiceWorkflowOrchestrator:
                 if call.tool_name == "create_order":
                     order_id = outcome.tool_result.data["order_id"]
             else:
-                stopped = outcome
+                stopped = step
 
         def result(**kwargs: Any) -> WorkflowResult:
             return self._result(
@@ -723,10 +1381,12 @@ class VoiceWorkflowOrchestrator:
             else ""
         )
 
+        interpreted = self._handoff_interpretation(understand_result, plan, approval, steps)
+
         if stopped is not None:
             summary = self._step_summary(steps)
             unknown = [s for s in steps if s.status is StepStatus.UNKNOWN]
-            run.failure_code = stopped.execution.error_code or stopped.tool_result.error_code
+            run.failure_code = stopped.error_code
             run.failure_message = stopped.message
 
             if unknown:
@@ -748,9 +1408,13 @@ class VoiceWorkflowOrchestrator:
                         s.tool_name for s in steps if s.status is not StepStatus.NOT_ATTEMPTED
                     ],
                     recommended_action=(
-                        "Check the business system for the unknown operation before "
-                        "re-approving; do not repeat it blindly."
+                        "Check the business system for the unknown operation and resolve it "
+                        "(POST /runs/{run_id}/executions/{execution_id}/resolve); do not "
+                        "repeat it blindly."
                     ),
+                    interpreted_request=interpreted,
+                    uncertainties=[f"{s.tool_name}: {s.message}" for s in unknown],
+                    evidence=self._step_evidence(steps),
                     now=now,
                 )
                 self._set_status(run, VoiceRunStatus.HANDOFF, now)
@@ -771,7 +1435,7 @@ class VoiceWorkflowOrchestrator:
             self.trace_service.record_stage(
                 run_id=run.run_id,
                 stage=TraceStage.FAILED,
-                tool_name=stopped.execution.tool_name,
+                tool_name=stopped.tool_name,
                 error_code=run.failure_code,
                 error_message=stopped.message,
                 output_summary=summary,
@@ -784,7 +1448,7 @@ class VoiceWorkflowOrchestrator:
             )
             return result(message=f"{stopped.message} {prefix} {summary}{not_performed}")
 
-        summary = f"Executed and verified approved plan: {', '.join(executed)}."
+        summary = f"Executed and verified approved plan: {', '.join(executed)}. {self._step_summary(steps)}"
         if plan.unsupported_actions:
             handoff_case = self.handoff_service.create_case(
                 run_id=run.run_id,
@@ -793,6 +1457,8 @@ class VoiceWorkflowOrchestrator:
                 blocked_actions=[a.value for a in plan.unsupported_actions],
                 attempted_actions=executed,
                 recommended_action=f"Perform manually: {unsupported}.",
+                interpreted_request=interpreted,
+                evidence=self._step_evidence(steps),
                 now=now,
             )
             self._set_status(run, VoiceRunStatus.HANDOFF, now)
@@ -840,11 +1506,20 @@ class VoiceWorkflowOrchestrator:
             reconciled=outcome.reconciled,
         )
 
-    @staticmethod
-    def _step_summary(steps: list[StepOutcome]) -> str:
+    def _step_summary(self, steps: list[StepOutcome]) -> str:
+        """
+        Per-step summary whose wording comes from the stored records (P2-F):
+        a verified order reads as e.g. "create_order [order 1a2b… DRAFT]", never
+        as "confirmed" or "dispatched" unless the record says so.
+        """
         groups: dict[StepStatus, list[str]] = {}
         for step in steps:
-            groups.setdefault(step.status, []).append(step.tool_name)
+            label = step.tool_name
+            if step.status is StepStatus.VERIFIED:
+                record = self._record_label(step)
+                if record:
+                    label = f"{step.tool_name} [{record}]"
+            groups.setdefault(step.status, []).append(label)
         labels = {
             StepStatus.VERIFIED: "Verified",
             StepStatus.FAILED: "Failed",
@@ -856,6 +1531,49 @@ class VoiceWorkflowOrchestrator:
             for status in labels
             if status in groups
         )
+
+    def _record_label(self, step: StepOutcome) -> str | None:
+        if not step.entity_id:
+            return None
+        entity_id = UUID(step.entity_id)
+        record: Any = None
+        kind = _ENTITY_ID_KEY.get(step.tool_name, "").removesuffix("_id")
+        if kind == "order":
+            record = self.repositories.orders.get_by_id(order_id=entity_id)
+        elif kind == "invoice":
+            record = self.repositories.invoices.get_by_id(invoice_id=entity_id)
+        elif kind == "dispatch":
+            record = self.repositories.dispatches.get_by_id(dispatch_id=entity_id)
+        if record is None:
+            return None
+        return f"{kind} {entity_id} {record.status.value}"
+
+    @staticmethod
+    def _step_evidence(steps: list[StepOutcome]) -> list[str]:
+        return [
+            f"{s.tool_name}: {s.status.value} (execution={s.execution_status}, "
+            f"verification={s.verification_status}, record={s.entity_id}, error={s.error_code})"
+            for s in steps
+        ]
+
+    @staticmethod
+    def _handoff_interpretation(
+        understand_result: UnderstandResult,
+        plan: ExecutionPlan,
+        approval: Approval,
+        steps: list[StepOutcome],
+    ) -> dict[str, Any]:
+        """Everything an operator needs to continue without replaying the request."""
+        return {
+            **interpret_semantic_state(understand_result.semantic_state),
+            "run_id": str(plan.run_id),
+            "plan_id": str(plan.plan_id),
+            "plan_fingerprint": plan.fingerprint,
+            "snapshot_version": plan.snapshot_version,
+            "approval_id": str(approval.approval_id),
+            "planned_tools": plan.tool_names,
+            "steps": [step.model_dump(mode="json") for step in steps],
+        }
 
     def _finish_without_writes(
         self,
@@ -945,6 +1663,7 @@ class VoiceWorkflowOrchestrator:
             created_at=now,
         )
         run.semantic_state_id = semantic_state.semantic_state_id
+        self.repositories.understand_results.save(understand_result=understand_result)
         self._set_status(run, VoiceRunStatus.SEMANTIC_READY, now)
         self.trace_service.record_stage(
             run_id=run.run_id,
@@ -998,6 +1717,7 @@ class VoiceWorkflowOrchestrator:
         is_approved: bool,
         now: datetime,
         utterance_time: datetime | None = None,
+        confirmed_warning_keys: frozenset[str] = frozenset(),
     ) -> _ActAssessment:
         # Relative dates resolve against when the user spoke; validity against now.
         context = self.context_resolver.resolve(
@@ -1051,6 +1771,7 @@ class VoiceWorkflowOrchestrator:
             business_context=context.business_context,
             is_approved=is_approved,
             run_id=run.run_id,
+            confirmed_warning_keys=confirmed_warning_keys,
         )
         self._set_status(run, VoiceRunStatus.DECIDED, now)
         self.trace_service.record_stage(
@@ -1090,9 +1811,78 @@ class VoiceWorkflowOrchestrator:
             output_summary=reason,
             timestamp=now,
         )
-        return self._result(
+        clarification = ClarificationRecord(
+            clarification_id=uuid4(),
+            run_id=run.run_id,
+            status=ClarificationStatus.OPEN,
+            reason_code=code.value,
+            reason=reason,
+            unresolved=self._unresolved_items(understand_result, act),
+            understood=interpret_semantic_state(understand_result.semantic_state),
+            understand_result=understand_result,
+            created_at=now,
+        )
+        self.repositories.clarifications.save(clarification=clarification)
+        self.trace_service.record_stage(
+            run_id=run.run_id,
+            stage=TraceStage.CLARIFICATION_RECORDED,
+            output_summary=(
+                f"Clarification {clarification.clarification_id}: "
+                f"{len(clarification.unresolved)} unresolved item(s)"
+            ),
+            timestamp=now,
+        )
+        result = self._result(
             run, understand_result, act=act, decision=decision, plan=plan, message=reason
         )
+        result.clarification = clarification
+        return result
+
+    @staticmethod
+    def _unresolved_items(
+        understand_result: UnderstandResult, act: _ActAssessment | None
+    ) -> list[dict[str, Any]]:
+        """
+        What is missing or uncertain, from evidence only (P2-J): Input Evaluation
+        reasons that stop execution, semantic ambiguities with every candidate,
+        and validation checks that failed or warned. Nothing is guessed.
+        """
+        items: list[dict[str, Any]] = []
+        for reason in understand_result.evaluation.reasons:
+            if reason.effect in {Actionability.CLARIFICATION_REQUIRED, Actionability.BLOCKED}:
+                items.append(
+                    {
+                        "source": "INPUT_EVALUATION",
+                        "code": reason.code.value,
+                        "slot": reason.slot.value if reason.slot else None,
+                        "message": reason.message,
+                    }
+                )
+        for ambiguity in understand_result.semantic_state.ambiguities:
+            items.append(
+                {
+                    "source": "SEMANTIC_AMBIGUITY",
+                    "code": ambiguity.ambiguity_type.value,
+                    "slot": ambiguity.slot.value,
+                    "message": ambiguity.description,
+                    "candidates": list(ambiguity.candidates),
+                }
+            )
+        if act is not None:
+            for check in act.validation.checks:
+                if check.status in {ValidationStatus.FAILED, ValidationStatus.WARNING}:
+                    items.append(
+                        {
+                            "source": "VALIDATION",
+                            "code": check.check_type,
+                            "slot": check.field,
+                            "message": check.message,
+                            "status": check.status.value,
+                        }
+                    )
+            for error in act.context.business_context.resolution_errors:
+                items.append({"source": "CONTEXT_RESOLUTION", "message": error})
+        return items
 
     def _block(
         self,
@@ -1141,7 +1931,7 @@ class VoiceWorkflowOrchestrator:
     @staticmethod
     def _result(
         run: VoiceRun,
-        understand_result: UnderstandResult,
+        understand_result: UnderstandResult | None,
         *,
         message: str,
         act: _ActAssessment | None = None,

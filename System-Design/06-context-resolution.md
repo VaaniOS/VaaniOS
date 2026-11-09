@@ -86,6 +86,30 @@ QUOTE_NOT_FOUND
 
 Do not invent a replacement price.
 
+### Implemented behaviour (ADR-019)
+
+- **Applicability.** A quote can price a transaction on the business date only if its
+  status is `VALID` and `quoted_on ≤ business date ≤ valid_until` (inclusive; no
+  `valid_until` = open-ended). `quoted_on` is the start of validity; there is no
+  separate `valid_from`. `ACCEPTED`, `DRAFT`, `EXPIRED`, `REJECTED` and `CANCELLED`
+  quotes are never executable pricing (the model defines no pricing semantics for
+  `ACCEPTED`, so it is not guessed).
+- **Dated reference** ("rate wahi jo parso bataya tha"): the anchor is the temporal
+  expression linked to the reference that `pricing[].reference_id` points to — not the
+  first temporal expression in the state. "parso" is resolved against the time the
+  user spoke (also when approval happens later). Only quotes given on that date are
+  candidates. None → `QUOTE_NOT_FOUND` (clarify; other dates listed, never substituted).
+  One that is no longer applicable → `INVALID` (handoff; the quote is kept as evidence).
+  Several applicable → `AMBIGUOUS_QUOTE` (clarify; no ranking).
+- **Undated reference** ("same rate", "old rate"): the single applicable quote for the
+  customer and product; several → `AMBIGUOUS_QUOTE`; only lapsed ones → handoff.
+- **Spoken price only**: the single applicable quote is the price and the spoken amount
+  is compared with it (mismatch → confirmation). No applicable quote → no price
+  (`PRICE_AUTHORITY`, handoff).
+- **No pricing at all**: no price is resolved (blocked).
+- Conflicting temporal links with no price pointer, or an anchor that cannot be resolved
+  to a date (weekday, explicit date), are not guessed: no quote is selected.
+
 ## 6.7 Inventory
 
 Inventory lookup must account for:

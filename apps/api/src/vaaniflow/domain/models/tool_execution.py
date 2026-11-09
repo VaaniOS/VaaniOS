@@ -59,6 +59,12 @@ class ToolExecution(DomainSchema):
     prior_status: ToolExecutionStatus | None = None
     prior_error_code: str | None = None
     prior_error_message: str | None = None
+    # How an UNKNOWN outcome was settled: RECONCILED_BY_READ_BACK (automatic),
+    # OPERATOR_CONFIRMED_SUCCESS / OPERATOR_CONFIRMED_FAILURE (operator, P2-D).
+    resolution: str | None = None
+    resolved_by: UUID | None = None
+    resolved_at: datetime | None = None
+    resolution_reason: str | None = None
     duration_ms: int | None = Field(default=None, ge=0)
 
     started_at: datetime

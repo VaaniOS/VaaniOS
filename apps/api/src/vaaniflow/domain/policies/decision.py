@@ -45,6 +45,8 @@ class DecisionReasonCode(StrEnum):
 
     HUMAN_REVIEW_REQUIRED = "HUMAN_REVIEW_REQUIRED"
 
+    DUPLICATE_ORDER = "DUPLICATE_ORDER"
+
 
 class Decision(DomainSchema):
     """

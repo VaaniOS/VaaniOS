@@ -153,25 +153,9 @@ class ContextResolutionService:
             resolution_results.append(temp_res)
             expression_dates[temp_expr.expression_id] = temp_date
 
-        # Only the temporal expression the semantic layer linked to the price
-        # reference constrains quote selection; an execution date ("dispatch
-        # kal") never does.
-        anchor_date: date | None = None
-        anchor_surface: str | None = None
-        anchor_unresolved: str | None = None
-        expressions = {e.expression_id: e for e in semantic_state.temporal_expressions}
-        for ref in semantic_state.references:
-            if (
-                ref.reference_type not in HISTORICAL_REFERENCE_TYPES
-                or ref.temporal_expression_id is None
-            ):
-                continue
-            linked = expressions.get(ref.temporal_expression_id)
-            anchor_surface = linked.surface_text if linked else ref.surface_text
-            anchor_date = expression_dates.get(ref.temporal_expression_id)
-            if anchor_date is None:
-                anchor_unresolved = anchor_surface
-            break
+        anchor_date, anchor_surface, anchor_unresolved = self._price_anchor(
+            semantic_state, expression_dates
+        )
 
         # 4. Resolve Historical Price / Quote
         primary_product = resolved_products[0] if resolved_products else None
@@ -258,6 +242,50 @@ class ContextResolutionService:
             tax_calculation=tax_calculation,
             snapshot=snapshot,
         )
+
+    @staticmethod
+    def _price_anchor(
+        semantic_state: SemanticState,
+        expression_dates: dict[UUID, date | None],
+    ) -> tuple[date | None, str | None, str | None]:
+        """
+        The date a historical price reference is anchored to (P2-I).
+
+        The reference the price itself points to (``pricing[].reference_id``)
+        is authoritative: only *its* linked temporal expression constrains
+        quote selection, wherever it appears in the state. Without such a
+        pointer, every historical reference with a temporal link is
+        considered, and links that disagree are not guessed between. An
+        execution date ("dispatch kal") is never linked, so it never applies.
+
+        Returns (anchor date, its surface text, surface text of an anchor
+        that could not be resolved).
+        """
+        references = {r.reference_id: r for r in semantic_state.references}
+        expressions = {e.expression_id: e for e in semantic_state.temporal_expressions}
+        price_refs = [
+            references[p.reference_id]
+            for p in semantic_state.pricing
+            if p.reference_id is not None and p.reference_id in references
+        ]
+        candidates = price_refs or [
+            r for r in semantic_state.references if r.reference_type in HISTORICAL_REFERENCE_TYPES
+        ]
+        surfaces: list[str] = []
+        dates: set[date | None] = set()
+        for ref in candidates:
+            expression_id = ref.temporal_expression_id
+            if expression_id is None:
+                continue
+            expression = expressions.get(expression_id)
+            surfaces.append(expression.surface_text if expression else ref.surface_text)
+            dates.add(expression_dates.get(expression_id))
+        if not surfaces:
+            return None, None, None
+        surface = " / ".join(dict.fromkeys(surfaces))
+        if len(dates) != 1 or None in dates:
+            return None, surface, surface
+        return dates.pop(), surface, None
 
     def _calculate_tax(
         self,

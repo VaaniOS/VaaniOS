@@ -6,7 +6,7 @@ from vaaniflow.context.models.business_context import BusinessContext
 from vaaniflow.context.resolvers.quote import HISTORICAL_REFERENCE_TYPES
 from vaaniflow.domain.models.customer import CustomerStatus
 from vaaniflow.domain.models.product import ProductStatus
-from vaaniflow.domain.models.quote import QuoteStatus
+from vaaniflow.domain.models.quote import Quote, QuoteStatus
 from vaaniflow.domain.models.tax import TaxCalculation
 from vaaniflow.domain.models.validation import (
     ValidationCheck,
@@ -381,6 +381,7 @@ class ValidationEngine:
                         field=f"quote.{quote.quote_id}.status",
                         expected=QuoteStatus.VALID.value,
                         actual=quote.status.value,
+                        evidence=_quote_evidence(quote),
                     )
                 )
             elif not quote.is_applicable_on(business_date):
@@ -397,6 +398,7 @@ class ValidationEngine:
                         field=f"quote.{quote.quote_id}.valid_until",
                         expected=f"{quote.quoted_on} <= {business_date} <= valid_until",
                         actual=str(quote.valid_until),
+                        evidence=_quote_evidence(quote),
                     )
                 )
             else:
@@ -576,3 +578,14 @@ class ValidationEngine:
                     field="negated_actions",
                 )
             )
+
+
+def _quote_evidence(quote: Quote) -> list[str]:
+    """Which quote record was rejected, so a handoff keeps the user's reference."""
+    return [
+        (
+            f"Quote {quote.quote_id}: {quote.unit_price} {quote.currency}/{quote.unit}, "
+            f"quoted {quote.quoted_on}, valid until {quote.valid_until}, "
+            f"status {quote.status.value}"
+        )
+    ]

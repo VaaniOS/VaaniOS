@@ -164,7 +164,7 @@ Reason:
 ## ADR-019 — Pricing authority: a spoken price is a claim
 
 Decision:
-The execution unit price is the price of exactly one quote for the resolved customer and product that is applicable on the business date: status VALID and `quoted_on ≤ business date ≤ valid_until` (inclusive; no `valid_until` means open-ended). A spoken amount is compared with that quote; a mismatch requires confirmation. A historical reference ("rate wahi jo parso bataya tha") only matches quotes given on the date of the temporal expression linked to it; no other date is substituted. If no applicable quote exists, nothing is executable: a spoken price without a quote goes to human handoff, a referenced rate without a matching quote is clarified.
+The execution unit price is the price of exactly one quote for the resolved customer and product that is applicable on the business date: status VALID and `quoted_on ≤ business date ≤ valid_until` (inclusive; no `valid_until` means open-ended). A spoken amount is compared with that quote; a mismatch requires confirmation. A historical reference ("rate wahi jo parso bataya tha") only matches quotes given on the date of the temporal expression linked to the reference the price points to (`pricing[].reference_id`); no other date is substituted. An undated reference ("same rate") uses the single applicable quote. If no applicable quote exists, nothing is executable: a spoken price without a quote goes to human handoff; a referenced rate with no quote on its date, or with several, is clarified; a referenced quote that exists but is no longer applicable goes to human handoff with the quote kept as evidence; a request with no pricing at all is blocked. `ACCEPTED` quotes are not executable pricing because the model does not define their semantics.
 
 This is the current business policy, not a permanent one. The catalog has no list prices, so a customer without a quote cannot be sold to by voice until an operator prices the request. A future catalog or operator-pricing source must be added as an explicit authority, never as a fallback.
 
@@ -178,3 +178,15 @@ Relative dates resolve against the time the user spoke, and quote validity again
 
 Reason:
 Quote validity and "parso" are only meaningful relative to a business date. Demos and evaluation must be deterministic without hard-coding dates into temporal resolution or weakening production behaviour.
+
+## ADR-021 — Follow-up, duplicate and audit semantics (P2)
+
+Decision:
+1. Duplicate orders are detected deterministically on business identity (customer, currency, line items with unit price, delivery address when both sides have one). An equivalent open order blocks a new one whenever it was placed; an equivalent completed (fulfilled or dispatched) order blocks only on the same business date; cancelled and failed orders never block. The check runs before approval is requested and again at execution. If existing orders cannot be read, no order is created (handoff).
+2. A CONFIRM decision creates a confirmation bound to its run, the exact warnings (`check_type|field|expected|actual`) and the business snapshot. A reply is classified deterministically as yes / no / unclear; only "yes" to a still-pending confirmation of the same run accepts exactly those warnings, and approval is still required afterwards. Changed facts expire it; a new instruction supersedes it.
+3. An UNKNOWN execution can be resolved by an operator only for the exact run, execution and attempt. SUCCEEDED requires a record stamped with that operation's idempotency key that passes read-back verification; FAILED is refused if such a record exists. The UNKNOWN history (`prior_*`) and the resolution (`resolution`, `resolved_by`, `resolved_at`, `resolution_reason`) are kept on the execution. Resolution never runs the remaining steps.
+4. Approvals record run, plan id and fingerprint, requested and approval-time snapshots, actors, timestamps, rejection and expiry reasons, `superseded_by`, and the records the plan produced. No identity is fabricated, and identities are claims (`actor_authenticated = false`) until authentication exists; they never grant authorization.
+5. Clarifications are persisted with what was understood and what is unresolved (evaluation reasons, ambiguities with candidates, failed checks); a new instruction supersedes them. Partial replies are not merged into the earlier request.
+
+Reason:
+Technical idempotency prevents a retried call from writing twice, not a second identical request from creating a second order. A "yes" must never approve something other than what was shown, an operator must not be able to declare success for a write that never happened, and the audit trail must answer what was approved, by whom, and what actually happened.

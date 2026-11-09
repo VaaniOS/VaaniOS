@@ -10,18 +10,21 @@ from vaaniflow.domain.models.tax import TaxRule
 from vaaniflow.domain.models.warehouse import Warehouse
 from vaaniflow.infrastructure.repositories.memory import (
     InMemoryApprovalRepository,
+    InMemoryClarificationRepository,
     InMemoryCustomerRepository,
     InMemoryDispatchRepository,
     InMemoryHandoffRepository,
     InMemoryInventoryRepository,
     InMemoryInvoiceRepository,
     InMemoryOrderRepository,
+    InMemoryPendingConfirmationRepository,
     InMemoryPendingExecutionRepository,
     InMemoryProductRepository,
     InMemoryQuoteRepository,
     InMemoryTaxRuleRepository,
     InMemoryToolExecutionRepository,
     InMemoryTraceRepository,
+    InMemoryUnderstandResultRepository,
     InMemoryVerificationRepository,
     InMemoryVoiceRunRepository,
     InMemoryWarehouseRepository,
@@ -340,3 +343,6 @@ class SyntheticRepositories:
         self.runs = InMemoryVoiceRunRepository()
         self.traces = InMemoryTraceRepository()
         self.pending_executions = InMemoryPendingExecutionRepository()
+        self.pending_confirmations = InMemoryPendingConfirmationRepository()
+        self.clarifications = InMemoryClarificationRepository()
+        self.understand_results = InMemoryUnderstandResultRepository()

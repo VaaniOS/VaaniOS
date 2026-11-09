@@ -24,6 +24,7 @@ from vaaniflow.application.ports.business_data import (
 from vaaniflow.domain.models.approval import Approval
 from vaaniflow.domain.models.customer import Customer, CustomerStatus
 from vaaniflow.domain.models.dispatch import Dispatch
+from vaaniflow.domain.models.followup import ClarificationRecord, PendingConfirmation
 from vaaniflow.domain.models.handoff import HandoffCase
 from vaaniflow.domain.models.inventory import Inventory
 from vaaniflow.domain.models.invoice import Invoice
@@ -35,6 +36,7 @@ from vaaniflow.domain.models.tool_execution import ToolExecution
 from vaaniflow.domain.models.verification import Verification
 from vaaniflow.domain.models.voice_run import VoiceRun
 from vaaniflow.domain.models.warehouse import Warehouse
+from vaaniflow.domain.schemas.understand import UnderstandResult
 from vaaniflow.traces.models import RunTrace, TraceEvent
 
 if TYPE_CHECKING:
@@ -505,3 +507,48 @@ class InMemoryPendingExecutionRepository:
 
     def list_by_run(self, *, run_id: UUID) -> list[PendingExecution]:
         return [p for p in self._pending.values() if p.plan.run_id == run_id]
+
+
+class InMemoryPendingConfirmationRepository:
+    """Confirmation prompts awaiting a yes/no reply, keyed by confirmation id."""
+
+    def __init__(self) -> None:
+        self._items: dict[UUID, PendingConfirmation] = {}
+
+    def save(self, *, confirmation: PendingConfirmation) -> None:
+        self._items[confirmation.confirmation_id] = confirmation
+
+    def get_by_id(self, *, confirmation_id: UUID) -> PendingConfirmation | None:
+        return self._items.get(confirmation_id)
+
+    def list_by_run(self, *, run_id: UUID) -> list[PendingConfirmation]:
+        return [c for c in self._items.values() if c.run_id == run_id]
+
+
+class InMemoryClarificationRepository:
+    """What was understood and what was missing each time a run stopped to ask."""
+
+    def __init__(self) -> None:
+        self._items: dict[UUID, ClarificationRecord] = {}
+
+    def save(self, *, clarification: ClarificationRecord) -> None:
+        self._items[clarification.clarification_id] = clarification
+
+    def get_by_id(self, *, clarification_id: UUID) -> ClarificationRecord | None:
+        return self._items.get(clarification_id)
+
+    def list_by_run(self, *, run_id: UUID) -> list[ClarificationRecord]:
+        return [c for c in self._items.values() if c.run_id == run_id]
+
+
+class InMemoryUnderstandResultRepository:
+    """Every UnderstandResult produced for a run, in order (the audit's "what was said")."""
+
+    def __init__(self) -> None:
+        self._items: list[UnderstandResult] = []
+
+    def save(self, *, understand_result: UnderstandResult) -> None:
+        self._items.append(understand_result)
+
+    def list_by_run(self, *, run_id: UUID) -> list[UnderstandResult]:
+        return [u for u in self._items if u.run_id == run_id]

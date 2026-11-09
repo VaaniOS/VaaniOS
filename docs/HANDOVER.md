@@ -69,13 +69,40 @@ All source paths below are relative to the repository root.
 | **HEAD** | `7b4d9d9` on `main` (local `main` is 1 commit ahead of the local `origin/main` tracking ref, so `7b4d9d9` itself may not be pushed yet; `d9e06b8` and earlier are) |
 | **Boundary** | Implementation stops at `UnderstandResult` (`apps/api/src/vaaniflow/domain/schemas/understand.py`) |
 | **Done (Arjun)** | Audio ingestion and preprocessing, Gnani STT adapter, transcript contract, semantic compiler (entities, items, pricing, references, corrections, temporal, ambiguity, negation), input evaluation, `UnderstandResult`, end-to-end Understand services, 296 tests, docs |
-| **Remaining (you)** | Business context, context resolution, agent orchestration, validation, risk/policy, human handoff, approval, execution, verification |
-| **Remaining (shared)** | Sandbox/evaluation, trace/observability, dashboard, integration, demo |
+| **ACT (since handover)** | Implemented: context resolution, validation, risk/policy, planning, approval, execution, verification, handoff, sandbox, traces, HTTP API — then hardened in three audited phases (P0 safety `2ac8390`, P1 correctness `ff28e0c`, P2 production hardening) |
+| **Remaining (shared)** | Dashboard, integration, persistence, authentication, demo polish |
 
-What already exists for ACT is **typed contracts only** — business models
-(`domain/models/`), policy/risk/decision schemas (`domain/policies/`) and
-context-resolution schemas (`context/models/`). No ACT logic, no business-data
-source, no persistence, no HTTP API.
+The rows above describe the state at handover. The ACT sections below (§14–§23)
+remain the design brief; the current implementation is summarised next.
+
+### Current state (after P0, P1 and P2 hardening)
+
+ACT runs over synthetic in-memory data. Its safety semantics:
+
+- **Plans** come only from requested − negated actions; one line item per request.
+- **Pricing**: the execution price is the price of exactly one quote applicable on
+  the business date (VALID and `quoted_on ≤ date ≤ valid_until`). A spoken price is a
+  claim (mismatch → bound confirmation). No applicable quote → no executable sale
+  (handoff). A historical reference only matches quotes given on the date of the
+  temporal expression linked to the price's own reference (ADR-019).
+- **Approval** is bound to run, plan fingerprint and business snapshot, re-validated at
+  execution, superseded by any new instruction on the run, and fully audited (run, plan,
+  snapshot, actors, timestamps, rejection/expiry reasons, `superseded_by`, produced
+  records). Identities are claims (`actor_authenticated = false`); they never authorize.
+- **Confirmation** (`POST /runs/{id}/confirm`) answers one pending confirmation of one
+  run, bound to its warnings and snapshot; it never executes (approval still required).
+- **Duplicate orders**: an open equivalent order blocks a new one; a completed one
+  only on the same business day; an unreadable order store blocks (handoff).
+- **Execution**: every write has a read-back contract and is verified; a timeout or
+  exception is `UNKNOWN`, reconciled by read-back, never blindly retried; operators can
+  resolve it (`POST /runs/{id}/executions/{execution_id}/resolve`) only with a verified
+  record committed by that operation. Per-step outcomes; `PARTIALLY_COMPLETED`; no
+  rollback claimed; messages state record statuses.
+- **Clarification and handoff** preserve what was understood (actions, references,
+  temporal expressions, pricing claims) and what is unresolved; `GET /runs/{id}/audit`
+  links instruction → plan → context → validation → approval → executions →
+  verifications → business records → handoffs → trace.
+- **Business clock**: real by default; `VAANIFLOW_BUSINESS_CLOCK=synthetic` for demos.
 
 ---
 
@@ -693,8 +720,12 @@ working tree (both the fix and this document were uncommitted at the time of wri
 
 # ACT — WHAT YOU MUST BUILD
 
-Everything below §13 up to §23 is **DESIGNED / NOT IMPLEMENTED** unless explicitly noted
-as CONTRACT ONLY. Order matters: build the business-data foundation before the agent.
+> Status: implemented and hardened (see "Current state" in §1). The sections below are
+> kept as the design brief the implementation follows.
+
+These sections were written as **DESIGNED / NOT IMPLEMENTED** at handover; the
+behaviours they describe are now implemented as summarised in §1. Where a section
+says "CONTRACT ONLY", the contract now has an implementation behind it.
 
 ## 14. ACT Phase 1 — Business context
 
@@ -1049,7 +1080,13 @@ Safety invariants that must never break (CLAUDE.md §2, 23 §23.6, 24):
 | RESOLVED (tooling) | Ruff 0.17.1 formats Python code blocks inside Markdown; README examples were normalized with `ruff format README.md` |
 | BUG (history) | Commits `743aaa0` … `41a22d2` are not individually green |
 | FUTURE FEATURE | Event/commitment extraction (design 21) |
-| FUTURE FEATURE | All of ACT, sandbox, trace, dashboard, HTTP API, TTS, persistence |
+| KNOWN LIMITATION | ACT uses synthetic in-memory repositories only; nothing persists across restarts |
+| KNOWN LIMITATION | One line item per request; multi-item requests are clarified |
+| KNOWN LIMITATION | No catalog/operator pricing: no applicable quote → no voice sale (ADR-019); `ACCEPTED` quotes not executable (semantics undefined) |
+| KNOWN LIMITATION | `/clarify` takes a full new instruction; partial answers are not merged into the earlier request (the clarification record is preserved) |
+| KNOWN LIMITATION | No authentication: approver/rejector/confirmer/resolver identities are recorded claims |
+| KNOWN LIMITATION | Only day-offset relative dates resolve; weekday/explicit dates linked to a rate → clarification |
+| FUTURE FEATURE | Dashboard, TTS, persistence, authentication/authorization |
 
 ---
 

@@ -25,7 +25,7 @@ def test_scenario_b_asr_quantity_error() -> None:
     result = runner.run_scenario(scenario)
     assert result.passed is True
     assert result.actual_decision == DecisionType.CONFIRM.value
-    assert result.actual_status == VoiceRunStatus.APPROVAL_REQUIRED.value
+    assert result.actual_status == VoiceRunStatus.CONFIRMATION_REQUIRED.value
     assert result.forbidden_actions_avoided is True
 
 
