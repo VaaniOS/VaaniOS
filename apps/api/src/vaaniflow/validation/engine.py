@@ -363,33 +363,6 @@ class ValidationEngine:
         tax_calculation: TaxCalculation | None,
         checks: list[ValidationCheck],
     ) -> None:
-        if business_context.resolved_price is None:
-            checks.append(
-                ValidationCheck(
-                    check_id=uuid4(),
-                    check_type="PRICE_RESOLVED",
-                    status=ValidationStatus.FAILED,
-                    severity=ValidationSeverity.CRITICAL,
-                    message="No valid unit price could be resolved from quotes or records.",
-                    field="resolved_price",
-                )
-            )
-            return
-
-        price = business_context.resolved_price
-        checks.append(
-            ValidationCheck(
-                check_id=uuid4(),
-                check_type="PRICE_RESOLVED",
-                status=ValidationStatus.PASSED,
-                severity=ValidationSeverity.INFO,
-                message=f"Unit price established at {price.unit_price} {price.currency}/{price.unit}.",
-                field="resolved_price",
-                actual=f"{price.unit_price} {price.currency}",
-                evidence=[f"Quote source: {price.source_quote_id or 'Direct spoken'}"],
-            )
-        )
-
         # Scenario D: Expired quote check
         for q in business_context.quotes:
             quote = q.quote
@@ -419,6 +392,33 @@ class ValidationEngine:
                         actual=QuoteStatus.VALID.value,
                     )
                 )
+
+        if business_context.resolved_price is None:
+            checks.append(
+                ValidationCheck(
+                    check_id=uuid4(),
+                    check_type="PRICE_RESOLVED",
+                    status=ValidationStatus.FAILED,
+                    severity=ValidationSeverity.CRITICAL,
+                    message="No valid unit price could be resolved from quotes or records.",
+                    field="resolved_price",
+                )
+            )
+            return
+
+        price = business_context.resolved_price
+        checks.append(
+            ValidationCheck(
+                check_id=uuid4(),
+                check_type="PRICE_RESOLVED",
+                status=ValidationStatus.PASSED,
+                severity=ValidationSeverity.INFO,
+                message=f"Unit price established at {price.unit_price} {price.currency}/{price.unit}.",
+                field="resolved_price",
+                actual=f"{price.unit_price} {price.currency}",
+                evidence=[f"Quote source: {price.source_quote_id or 'Direct spoken'}"],
+            )
+        )
 
         # Spoken price vs quote price consistency
         if semantic_state.pricing and price.source_quote_id is not None:

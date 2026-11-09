@@ -84,6 +84,11 @@ _PATTERNS: tuple[_Pattern, ...] = (
             "price we discussed",
             "rate discussed earlier",
             "price discussed earlier",
+            "rate quoted",
+            "quoted rate",
+            "quoted price",
+            "rate told",
+            "rate given",
         ),
     ),
     _Pattern(

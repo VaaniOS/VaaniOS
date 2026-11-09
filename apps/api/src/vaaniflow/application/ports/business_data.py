@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 from uuid import UUID
 
 from vaaniflow.domain.models.approval import Approval
@@ -16,7 +16,11 @@ from vaaniflow.domain.models.quote import Quote, QuoteStatus
 from vaaniflow.domain.models.tax import TaxRule
 from vaaniflow.domain.models.tool_execution import ToolExecution
 from vaaniflow.domain.models.verification import Verification
+from vaaniflow.domain.models.voice_run import VoiceRun
 from vaaniflow.domain.models.warehouse import Warehouse
+
+if TYPE_CHECKING:
+    from vaaniflow.traces.models import RunTrace, TraceEvent
 
 
 class BusinessDataError(Exception):
@@ -287,4 +291,36 @@ class VerificationRepository(Protocol):
 
     def list_by_run(self, *, run_id: UUID) -> list[Verification]:
         """List verifications for a run."""
+        ...
+
+
+class VoiceRunRepository(Protocol):
+    """Port for voice run lifecycle persistence and retrieval."""
+
+    def save(self, *, run: VoiceRun) -> None:
+        """Save or update a voice run."""
+        ...
+
+    def get_by_id(self, *, run_id: UUID) -> VoiceRun | None:
+        """Retrieve voice run by ID."""
+        ...
+
+    def list_all(self) -> list[VoiceRun]:
+        """List all voice runs."""
+        ...
+
+
+class TraceRepository(Protocol):
+    """Port for observability trace event persistence and retrieval."""
+
+    def record_event(self, *, event: TraceEvent) -> None:
+        """Record a single trace event."""
+        ...
+
+    def get_trace(self, *, run_id: UUID) -> RunTrace | None:
+        """Get the full chronological trace for a run."""
+        ...
+
+    def list_all_traces(self) -> list[RunTrace]:
+        """List all stored run traces."""
         ...

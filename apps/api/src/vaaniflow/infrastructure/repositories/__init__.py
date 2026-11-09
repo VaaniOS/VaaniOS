@@ -10,7 +10,9 @@ from vaaniflow.infrastructure.repositories.memory import (
     InMemoryQuoteRepository,
     InMemoryTaxRuleRepository,
     InMemoryToolExecutionRepository,
+    InMemoryTraceRepository,
     InMemoryVerificationRepository,
+    InMemoryVoiceRunRepository,
     InMemoryWarehouseRepository,
 )
 from vaaniflow.infrastructure.repositories.synthetic_data import (
@@ -35,7 +37,9 @@ __all__ = [
     "InMemoryQuoteRepository",
     "InMemoryTaxRuleRepository",
     "InMemoryToolExecutionRepository",
+    "InMemoryTraceRepository",
     "InMemoryVerificationRepository",
+    "InMemoryVoiceRunRepository",
     "InMemoryWarehouseRepository",
     "SyntheticRepositories",
     "get_synthetic_customers",

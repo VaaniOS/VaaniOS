@@ -20,7 +20,9 @@ from vaaniflow.infrastructure.repositories.memory import (
     InMemoryQuoteRepository,
     InMemoryTaxRuleRepository,
     InMemoryToolExecutionRepository,
+    InMemoryTraceRepository,
     InMemoryVerificationRepository,
+    InMemoryVoiceRunRepository,
     InMemoryWarehouseRepository,
 )
 
@@ -312,3 +314,5 @@ class SyntheticRepositories:
         self.handoffs = InMemoryHandoffRepository()
         self.tool_executions = InMemoryToolExecutionRepository()
         self.verifications = InMemoryVerificationRepository()
+        self.runs = InMemoryVoiceRunRepository()
+        self.traces = InMemoryTraceRepository()
