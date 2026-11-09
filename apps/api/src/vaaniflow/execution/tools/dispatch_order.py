@@ -3,7 +3,15 @@ from uuid import UUID, uuid4
 
 from vaaniflow.domain.models.dispatch import Dispatch, DispatchStatus
 from vaaniflow.domain.models.tool_execution import ToolSideEffect
-from vaaniflow.execution.tools.base import Tool, ToolContext, ToolResult
+from vaaniflow.execution.tools.base import (
+    TIMEOUT_AFTER_COMMIT,
+    TIMEOUT_BEFORE_COMMIT,
+    Tool,
+    ToolContext,
+    ToolResult,
+    simulated_timeout,
+    timeout_result,
+)
 
 
 class DispatchOrderTool(Tool):
@@ -15,6 +23,9 @@ class DispatchOrderTool(Tool):
     is_idempotent = True
 
     def execute(self, *, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
+        timeout = simulated_timeout(context, self.name)
+        if timeout == TIMEOUT_BEFORE_COMMIT:
+            return timeout_result(self.name)
         # Failure injection sandbox support (Scenario G)
         if context.metadata.get("simulate_dispatch_failure"):
             return ToolResult(
@@ -38,11 +49,14 @@ class DispatchOrderTool(Tool):
                 status=DispatchStatus.DISPATCHED,
                 recipient_name=recipient_name,
                 delivery_address=delivery_address,
+                idempotency_key=context.idempotency_key,
                 created_at=context.now,
                 updated_at=context.now,
             )
 
             context.repositories.dispatches.save(dispatch=dispatch)
+            if timeout == TIMEOUT_AFTER_COMMIT:
+                return timeout_result(self.name)
 
             return ToolResult(
                 success=True,

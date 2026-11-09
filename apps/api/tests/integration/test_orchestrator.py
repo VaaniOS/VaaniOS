@@ -1,12 +1,15 @@
-from datetime import UTC, datetime
 from uuid import uuid4
 
 from vaaniflow.application.services.orchestrator import VoiceWorkflowOrchestrator
 from vaaniflow.domain.models.voice_run import VoiceRunStatus
 from vaaniflow.domain.policies.decision import DecisionType
-from vaaniflow.infrastructure.repositories.synthetic_data import SyntheticRepositories
+from vaaniflow.infrastructure.repositories.synthetic_data import (
+    SYNTHETIC_BUSINESS_TIME,
+    SyntheticRepositories,
+)
 
-_NOW = datetime.now(UTC)
+# Quotes are only valid relative to the dataset's business clock.
+_NOW = SYNTHETIC_BUSINESS_TIME
 
 
 def test_orchestrator_full_happy_path_with_approval() -> None:

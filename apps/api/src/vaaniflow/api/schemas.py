@@ -7,6 +7,7 @@ from vaaniflow.domain.models.voice_run import VoiceRunStatus
 from vaaniflow.domain.policies.decision import DecisionType
 from vaaniflow.domain.schemas.semantic import Ambiguity
 from vaaniflow.domain.schemas.understand import EvaluationReason
+from vaaniflow.execution.plan import StepOutcome
 
 
 class CreateRunRequest(BaseModel):
@@ -45,6 +46,9 @@ class WorkflowResponse(BaseModel):
     unsupported_actions: list[str] = Field(default_factory=list)
     excluded_negated_actions: list[str] = Field(default_factory=list)
     executed_tools: list[str] = Field(default_factory=list)
+    # Per-tool evidence for an executed plan: VERIFIED / FAILED / UNKNOWN / NOT_ATTEMPTED.
+    tool_outcomes: list[StepOutcome] = Field(default_factory=list)
+    superseded_approval_ids: list[UUID] = Field(default_factory=list)
 
 
 class ApproveRequest(BaseModel):

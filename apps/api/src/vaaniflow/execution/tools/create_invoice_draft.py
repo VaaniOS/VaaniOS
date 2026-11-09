@@ -4,7 +4,15 @@ from uuid import UUID, uuid4
 
 from vaaniflow.domain.models.invoice import Invoice, InvoiceItem, InvoiceStatus
 from vaaniflow.domain.models.tool_execution import ToolSideEffect
-from vaaniflow.execution.tools.base import Tool, ToolContext, ToolResult
+from vaaniflow.execution.tools.base import (
+    TIMEOUT_AFTER_COMMIT,
+    TIMEOUT_BEFORE_COMMIT,
+    Tool,
+    ToolContext,
+    ToolResult,
+    simulated_timeout,
+    timeout_result,
+)
 
 
 class CreateInvoiceDraftTool(Tool):
@@ -16,6 +24,9 @@ class CreateInvoiceDraftTool(Tool):
     is_idempotent = True
 
     def execute(self, *, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
+        timeout = simulated_timeout(context, self.name)
+        if timeout == TIMEOUT_BEFORE_COMMIT:
+            return timeout_result(self.name)
         # Failure injection sandbox support (Scenario F)
         if context.metadata.get("simulate_invoice_failure"):
             return ToolResult(
@@ -62,11 +73,14 @@ class CreateInvoiceDraftTool(Tool):
                 tax_total=tax_total,
                 total=total,
                 status=InvoiceStatus.DRAFT,
+                idempotency_key=context.idempotency_key,
                 created_at=context.now,
                 updated_at=context.now,
             )
 
             context.repositories.invoices.save(invoice=invoice)
+            if timeout == TIMEOUT_AFTER_COMMIT:
+                return timeout_result(self.name)
 
             return ToolResult(
                 success=True,

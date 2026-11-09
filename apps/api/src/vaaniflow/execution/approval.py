@@ -92,6 +92,21 @@ class ApprovalService:
         self._repositories.approvals.save(approval=approval)
         return approval
 
+    def supersede(self, *, approval_id: UUID, now: datetime | None = None) -> Approval:
+        """
+        Mark a still-REQUESTED approval SUPERSEDED: a newer instruction on the
+        same run replaced it. The record is kept for audit; it can never execute.
+        """
+        approval = self._repositories.approvals.get_by_id(approval_id=approval_id)
+        if approval is None:
+            raise ValueError(f"Approval request {approval_id} not found.")
+        if approval.status is not ApprovalStatus.REQUESTED:
+            return approval
+        approval.status = ApprovalStatus.SUPERSEDED
+        approval.resolved_at = now or datetime.now(UTC)
+        self._repositories.approvals.save(approval=approval)
+        return approval
+
     def get_approval(self, *, approval_id: UUID) -> Approval | None:
         """Retrieve approval record by ID."""
         return self._repositories.approvals.get_by_id(approval_id=approval_id)

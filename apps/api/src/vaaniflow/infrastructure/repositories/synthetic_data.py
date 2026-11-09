@@ -30,6 +30,12 @@ from vaaniflow.infrastructure.repositories.memory import (
 # Reference timestamp for synthetic records
 _NOW = datetime(2026, 10, 18, 12, 0, 0, tzinfo=UTC)
 
+# Business clock the synthetic dataset is written against: 2026-10-17 12:00
+# Asia/Kolkata. "parso" spoken then means 2026-10-15, the date of the canonical
+# Sharma Builders quote. Quote validity windows are only meaningful relative to
+# a business date, so deterministic scenarios and tests run at this time.
+SYNTHETIC_BUSINESS_TIME = datetime(2026, 10, 17, 6, 30, 0, tzinfo=UTC)
+
 # Deterministic UUIDs
 CUST_SHARMA_BUILDERS_ID = UUID("00000000-0000-4000-8000-000000000001")
 CUST_SHARMA_BUILDTECH_ID = UUID("00000000-0000-4000-8000-000000000002")
@@ -45,6 +51,7 @@ PROD_JSW_STEEL_ID = UUID("00000000-0000-4000-8000-000000000023")
 
 QUOTE_SHARMA_ULTRATECH_VALID_ID = UUID("00000000-0000-4000-8000-000000000030")
 QUOTE_SHARMA_ACC_EXPIRED_ID = UUID("00000000-0000-4000-8000-000000000031")
+QUOTE_KUMAR_ACC_VALID_ID = UUID("00000000-0000-4000-8000-000000000032")
 
 INV_ULTRATECH_ID = UUID("00000000-0000-4000-8000-000000000040")
 INV_ULTRATECH_SUPER_ID = UUID("00000000-0000-4000-8000-000000000041")
@@ -229,6 +236,21 @@ def get_synthetic_quotes() -> list[Quote]:
             quoted_on=date(2026, 8, 1),
             valid_until=date(2026, 9, 1),
             status=QuoteStatus.EXPIRED,
+            customer_specific=True,
+            created_at=_NOW,
+            updated_at=_NOW,
+        ),
+        # Current quote for Kumar Constructions on ACC cement (non-Sharma fixture)
+        Quote(
+            quote_id=QUOTE_KUMAR_ACC_VALID_ID,
+            customer_id=CUST_KUMAR_CONSTRUCTIONS_ID,
+            product_id=PROD_ACC_CEMENT_ID,
+            unit="bag",
+            unit_price=Decimal("400.00"),
+            currency="INR",
+            quoted_on=date(2026, 10, 10),
+            valid_until=date(2026, 12, 31),
+            status=QuoteStatus.VALID,
             customer_specific=True,
             created_at=_NOW,
             updated_at=_NOW,

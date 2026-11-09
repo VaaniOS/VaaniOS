@@ -13,6 +13,8 @@ class ApprovalStatus(StrEnum):
     APPROVED = "APPROVED"
     REJECTED = "REJECTED"
     EXPIRED = "EXPIRED"
+    # A newer instruction on the same run replaced this request; never executable.
+    SUPERSEDED = "SUPERSEDED"
 
 
 class Approval(DomainSchema):

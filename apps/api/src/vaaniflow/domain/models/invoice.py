@@ -55,5 +55,8 @@ class Invoice(DomainSchema):
 
     status: InvoiceStatus
 
+    # Key of the write that created this record; used to reconcile UNKNOWN outcomes.
+    idempotency_key: str | None = None
+
     created_at: datetime
     updated_at: datetime

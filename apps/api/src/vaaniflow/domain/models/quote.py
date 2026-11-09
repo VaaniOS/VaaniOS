@@ -44,3 +44,15 @@ class Quote(DomainSchema):
 
     created_at: datetime
     updated_at: datetime
+
+    def is_applicable_on(self, day: date) -> bool:
+        """
+        True when this quote may price a transaction on ``day``: its status is
+        VALID and ``day`` lies inside [quoted_on, valid_until]. A VALID status
+        alone is not enough once the validity window has passed.
+        """
+        if self.status is not QuoteStatus.VALID:
+            return False
+        if day < self.quoted_on:
+            return False
+        return self.valid_until is None or day <= self.valid_until

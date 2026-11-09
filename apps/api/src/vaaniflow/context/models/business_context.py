@@ -56,3 +56,6 @@ class BusinessContext(DomainSchema):
     unresolved_references: list[str] = Field(default_factory=list)
     resolution_errors: list[str] = Field(default_factory=list)
     resolved_at: datetime
+    # Business-timezone date on which the transaction would execute; quote
+    # validity is checked against it. None only for legacy callers.
+    business_date: date | None = None

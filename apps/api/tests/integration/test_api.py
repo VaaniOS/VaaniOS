@@ -2,12 +2,14 @@ from fastapi.testclient import TestClient
 
 from vaaniflow.api.app import app
 from vaaniflow.api.dependencies import reset_container
+from vaaniflow.infrastructure.repositories.synthetic_data import SYNTHETIC_BUSINESS_TIME
 
 client = TestClient(app)
 
 
 def setup_function() -> None:
-    reset_container()
+    # Quotes are only valid relative to the dataset's business clock.
+    reset_container(clock=lambda: SYNTHETIC_BUSINESS_TIME)
 
 
 def test_health_endpoint() -> None:

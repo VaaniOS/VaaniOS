@@ -23,6 +23,7 @@ _APPROVAL_ERROR_STATUS = {
     "APPROVAL_NOT_FOUND": status.HTTP_404_NOT_FOUND,
     "APPROVAL_RUN_MISMATCH": status.HTTP_409_CONFLICT,
     "APPROVAL_NOT_PENDING": status.HTTP_409_CONFLICT,
+    "APPROVAL_SUPERSEDED": status.HTTP_409_CONFLICT,
 }
 
 
@@ -40,7 +41,11 @@ def _to_response(result: WorkflowResult) -> WorkflowResponse:
         and result.approval is not None,
         approval_id=result.approval.approval_id if result.approval else None,
         handoff_case_id=result.handoff_case.handoff_id if result.handoff_case else None,
-        execution_success=result.execution_outcome.success if result.execution_outcome else None,
+        execution_success=(
+            result.all_steps_verified
+            if result.step_outcomes
+            else (result.execution_outcome.success if result.execution_outcome else None)
+        ),
         actionability=understand.actionability.value if understand else None,
         evaluation_reasons=list(understand.evaluation.reasons) if understand else [],
         ambiguities=list(understand.semantic_state.ambiguities) if understand else [],
@@ -48,6 +53,8 @@ def _to_response(result: WorkflowResult) -> WorkflowResponse:
         unsupported_actions=[a.value for a in plan.unsupported_actions] if plan else [],
         excluded_negated_actions=[a.value for a in plan.excluded_negated_actions] if plan else [],
         executed_tools=result.executed_tools,
+        tool_outcomes=list(result.step_outcomes),
+        superseded_approval_ids=list(result.superseded_approval_ids),
     )
 
 
@@ -213,20 +220,13 @@ def clarify_run(
     if not run:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found.")
 
-    # Resume with clarified text
+    # Resume with clarified text. Any approval still pending on this run is
+    # superseded; the response carries the new approval_id if one is requested.
     result = container.orchestrator.process_text(
         text=payload.clarification,
         run_id=run_id,
     )
-
-    return WorkflowResponse(
-        run_id=result.run.run_id,
-        status=result.run.status,
-        message=result.message,
-        decision=result.decision.decision if result.decision else None,
-        decision_reason=result.decision.reason if result.decision else None,
-        execution_success=result.execution_outcome.success if result.execution_outcome else None,
-    )
+    return _to_response(result)
 
 
 @router.post("/{run_id}/handoff")

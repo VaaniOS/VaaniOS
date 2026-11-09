@@ -4,7 +4,15 @@ from uuid import UUID, uuid4
 
 from vaaniflow.domain.models.order import Order, OrderItem, OrderStatus
 from vaaniflow.domain.models.tool_execution import ToolSideEffect
-from vaaniflow.execution.tools.base import Tool, ToolContext, ToolResult
+from vaaniflow.execution.tools.base import (
+    TIMEOUT_AFTER_COMMIT,
+    TIMEOUT_BEFORE_COMMIT,
+    Tool,
+    ToolContext,
+    ToolResult,
+    simulated_timeout,
+    timeout_result,
+)
 
 
 class CreateOrderTool(Tool):
@@ -16,6 +24,9 @@ class CreateOrderTool(Tool):
     is_idempotent = True
 
     def execute(self, *, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
+        timeout = simulated_timeout(context, self.name)
+        if timeout == TIMEOUT_BEFORE_COMMIT:
+            return timeout_result(self.name)
         try:
             customer_id = UUID(str(arguments["customer_id"]))
             currency = str(arguments.get("currency", "INR"))
@@ -55,11 +66,14 @@ class CreateOrderTool(Tool):
                 subtotal=subtotal,
                 status=OrderStatus.DRAFT,
                 source_run_id=context.run_id,
+                idempotency_key=context.idempotency_key,
                 created_at=context.now,
                 updated_at=context.now,
             )
 
             context.repositories.orders.save(order=order)
+            if timeout == TIMEOUT_AFTER_COMMIT:
+                return timeout_result(self.name)
 
             return ToolResult(
                 success=True,

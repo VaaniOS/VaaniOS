@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from vaaniflow.api.app import app
 from vaaniflow.api.dependencies import AppContainer, reset_container
+from vaaniflow.infrastructure.repositories.synthetic_data import SYNTHETIC_BUSINESS_TIME
 
 client = TestClient(app)
 
@@ -15,7 +16,7 @@ KUMAR_DISPATCH = "Kumar Constructions ko 10 bags ACC cement ₹400 per bag dispa
 
 
 def _fresh() -> AppContainer:
-    return reset_container()
+    return reset_container(clock=lambda: SYNTHETIC_BUSINESS_TIME)
 
 
 def _process(text: str) -> tuple[str, dict]:  # type: ignore[type-arg]

@@ -173,6 +173,10 @@ class OrderRepository(Protocol):
         """List orders for a customer."""
         ...
 
+    def get_by_idempotency_key(self, *, idempotency_key: str) -> Order | None:
+        """Retrieve the record created by the write with this idempotency key."""
+        ...
+
     def list_all(self) -> list[Order]:
         """List all orders."""
         ...
@@ -193,6 +197,10 @@ class InvoiceRepository(Protocol):
         """Retrieve invoice associated with an order."""
         ...
 
+    def get_by_idempotency_key(self, *, idempotency_key: str) -> Invoice | None:
+        """Retrieve the record created by the write with this idempotency key."""
+        ...
+
     def list_all(self) -> list[Invoice]:
         """List all invoices."""
         ...
@@ -211,6 +219,10 @@ class DispatchRepository(Protocol):
 
     def get_by_order_id(self, *, order_id: UUID) -> Dispatch | None:
         """Retrieve dispatch record for an order."""
+        ...
+
+    def get_by_idempotency_key(self, *, idempotency_key: str) -> Dispatch | None:
+        """Retrieve the record created by the write with this idempotency key."""
         ...
 
     def list_all(self) -> list[Dispatch]:

@@ -74,6 +74,27 @@ class PolicyEngine:
                 policy_version=self.VERSION,
             )
 
+        # 1b. Rule: A referenced rate ("rate wahi jo parso bataya tha") with no
+        #     matching quote -> CLARIFY. Another quote is never substituted.
+        quote_reference_failures = [
+            c
+            for c in validation_result.checks
+            if c.check_type == "QUOTE_REFERENCE" and c.status == ValidationStatus.FAILED
+        ]
+        if quote_reference_failures:
+            return Decision(
+                decision_id=uuid4(),
+                run_id=run_id,
+                decision=DecisionType.CLARIFY,
+                reason_code=DecisionReasonCode.MISSING_INFORMATION,
+                reason=quote_reference_failures[0].message,
+                allowed=False,
+                requires_user_confirmation=False,
+                requires_approval=False,
+                requires_human_handoff=False,
+                policy_version=self.VERSION,
+            )
+
         # 2. Rule: Suspicious Magnitude or Major Warning -> CONFIRM
         magnitude_warnings = [
             c
@@ -96,11 +117,13 @@ class PolicyEngine:
                 policy_version=self.VERSION,
             )
 
-        # 3. Rule: Conflicting Business Data / Quote Expiry / Shortage -> HUMAN_HANDOFF
+        # 3. Rule: Conflicting Business Data / Quote Expiry / Shortage /
+        #    unverifiable spoken price -> HUMAN_HANDOFF (a person with pricing
+        #    authority decides; the spoken amount is never applied on its own)
         shortage_or_quote_failures = [
             c
             for c in validation_result.checks
-            if c.check_type in {"QUOTE_VALIDITY", "INVENTORY_AVAILABILITY"}
+            if c.check_type in {"QUOTE_VALIDITY", "INVENTORY_AVAILABILITY", "PRICE_AUTHORITY"}
             and c.status == ValidationStatus.FAILED
         ]
         if shortage_or_quote_failures:

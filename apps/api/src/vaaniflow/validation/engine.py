@@ -3,6 +3,7 @@ from decimal import Decimal
 from uuid import UUID, uuid4
 
 from vaaniflow.context.models.business_context import BusinessContext
+from vaaniflow.context.resolvers.quote import HISTORICAL_REFERENCE_TYPES
 from vaaniflow.domain.models.customer import CustomerStatus
 from vaaniflow.domain.models.product import ProductStatus
 from vaaniflow.domain.models.quote import QuoteStatus
@@ -363,7 +364,10 @@ class ValidationEngine:
         tax_calculation: TaxCalculation | None,
         checks: list[ValidationCheck],
     ) -> None:
-        # Scenario D: Expired quote check
+        business_date = business_context.business_date or business_context.resolved_at.date()
+
+        # Scenario D: Expired quote check. A VALID status is not enough: the
+        # business date must also lie inside the quote's validity window.
         for q in business_context.quotes:
             quote = q.quote
             if quote.status != QuoteStatus.VALID:
@@ -377,6 +381,22 @@ class ValidationEngine:
                         field=f"quote.{quote.quote_id}.status",
                         expected=QuoteStatus.VALID.value,
                         actual=quote.status.value,
+                    )
+                )
+            elif not quote.is_applicable_on(business_date):
+                checks.append(
+                    ValidationCheck(
+                        check_id=uuid4(),
+                        check_type="QUOTE_VALIDITY",
+                        status=ValidationStatus.FAILED,
+                        severity=ValidationSeverity.CRITICAL,
+                        message=(
+                            f"Quote {quote.quote_id} (quoted {quote.quoted_on}, valid until "
+                            f"{quote.valid_until}) is not applicable on {business_date}."
+                        ),
+                        field=f"quote.{quote.quote_id}.valid_until",
+                        expected=f"{quote.quoted_on} <= {business_date} <= valid_until",
+                        actual=str(quote.valid_until),
                     )
                 )
             else:
@@ -393,6 +413,47 @@ class ValidationEngine:
                     )
                 )
 
+        has_historical_ref = any(
+            r.reference_type in HISTORICAL_REFERENCE_TYPES for r in semantic_state.references
+        )
+        if (
+            has_historical_ref
+            and not business_context.quotes
+            and "HISTORICAL_PRICE" in business_context.unresolved_references
+        ):
+            checks.append(
+                ValidationCheck(
+                    check_id=uuid4(),
+                    check_type="QUOTE_REFERENCE",
+                    status=ValidationStatus.FAILED,
+                    severity=ValidationSeverity.HIGH,
+                    message="The referenced rate could not be matched to a business quote: "
+                    + "; ".join(
+                        e
+                        for e in business_context.resolution_errors
+                        if e.startswith(("Quote not found", "Ambiguous quote", "Invalid quote"))
+                    ),
+                    field="references.HISTORICAL_PRICE",
+                )
+            )
+
+        spoken_amounts = [p.amount for p in semantic_state.pricing if p.amount is not None]
+        if business_context.resolved_price is None and spoken_amounts and not has_historical_ref:
+            checks.append(
+                ValidationCheck(
+                    check_id=uuid4(),
+                    check_type="PRICE_AUTHORITY",
+                    status=ValidationStatus.FAILED,
+                    severity=ValidationSeverity.HIGH,
+                    message=(
+                        f"Spoken price {spoken_amounts[0]} is not backed by any business quote "
+                        f"valid on {business_date}; a spoken price is not authoritative."
+                    ),
+                    field="pricing.amount",
+                    actual=str(spoken_amounts[0]),
+                )
+            )
+
         if business_context.resolved_price is None:
             checks.append(
                 ValidationCheck(
@@ -407,6 +468,17 @@ class ValidationEngine:
             return
 
         price = business_context.resolved_price
+        if price.source_quote_id is None:
+            checks.append(
+                ValidationCheck(
+                    check_id=uuid4(),
+                    check_type="PRICE_AUTHORITY",
+                    status=ValidationStatus.FAILED,
+                    severity=ValidationSeverity.CRITICAL,
+                    message="The resolved unit price has no business quote as its source.",
+                    field="resolved_price.source_quote_id",
+                )
+            )
         checks.append(
             ValidationCheck(
                 check_id=uuid4(),

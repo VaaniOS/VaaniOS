@@ -22,6 +22,8 @@ class VoiceRunStatus(StrEnum):
     APPROVAL_REQUIRED = "APPROVAL_REQUIRED"
     EXECUTING = "EXECUTING"
     COMPLETED = "COMPLETED"
+    # Some planned writes are verified, at least one failed; nothing was rolled back.
+    PARTIALLY_COMPLETED = "PARTIALLY_COMPLETED"
 
     CLARIFICATION_REQUIRED = "CLARIFICATION_REQUIRED"
     HANDOFF = "HANDOFF"

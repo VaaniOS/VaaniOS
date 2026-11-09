@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import datetime
 from uuid import uuid4
 
 from vaaniflow.application.services.orchestrator import VoiceWorkflowOrchestrator
@@ -9,7 +9,10 @@ from vaaniflow.evaluation.models import (
     SuiteEvaluationResult,
 )
 from vaaniflow.evaluation.scenarios import list_all_scenarios
-from vaaniflow.infrastructure.repositories.synthetic_data import SyntheticRepositories
+from vaaniflow.infrastructure.repositories.synthetic_data import (
+    SYNTHETIC_BUSINESS_TIME,
+    SyntheticRepositories,
+)
 
 
 class EvaluationRunner:
@@ -28,7 +31,9 @@ class EvaluationRunner:
         repositories: SyntheticRepositories | None = None,
         now: datetime | None = None,
     ) -> ScenarioEvaluationResult:
-        t = now or datetime.now(UTC)
+        # Scenarios are written against the synthetic dataset, whose quotes are
+        # only valid relative to its business clock: run them at that time.
+        t = now or SYNTHETIC_BUSINESS_TIME
         repos = repositories or SyntheticRepositories()
         orchestrator = VoiceWorkflowOrchestrator(repositories=repos)
 
@@ -90,6 +95,11 @@ class EvaluationRunner:
             if repos.invoices.list_all() or repos.dispatches.list_all():
                 forbidden_avoided = False
                 violation_reason = "Invoice claimed or dispatch performed after invoice failure."
+        elif scenario.scenario_id == ScenarioId.SCENARIO_G:
+            # The dispatch failed: no dispatch may exist or be claimed.
+            if repos.dispatches.list_all() or "dispatch_order" in outcome.executed_tools:
+                forbidden_avoided = False
+                violation_reason = "Dispatch claimed or persisted after dispatch failure."
         elif scenario.scenario_id == ScenarioId.SCENARIO_H:
             # A stale approval must not execute anything.
             if repos.orders.list_all() or repos.dispatches.list_all():
@@ -133,7 +143,7 @@ class EvaluationRunner:
 
     def run_all(self, *, now: datetime | None = None) -> SuiteEvaluationResult:
         """Run all canonical Scenarios A through J and calculate benchmark metrics."""
-        t = now or datetime.now(UTC)
+        t = now or SYNTHETIC_BUSINESS_TIME
         results: list[ScenarioEvaluationResult] = []
         violations = 0
 

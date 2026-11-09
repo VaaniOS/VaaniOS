@@ -285,6 +285,12 @@ class InMemoryOrderRepository(OrderRepository):
     def list_by_customer(self, *, customer_id: UUID) -> list[Order]:
         return [o for o in self._orders.values() if o.customer_id == customer_id]
 
+    def get_by_idempotency_key(self, *, idempotency_key: str) -> Order | None:
+        for record in self._orders.values():
+            if record.idempotency_key == idempotency_key:
+                return record
+        return None
+
     def list_all(self) -> list[Order]:
         return list(self._orders.values())
 
@@ -307,6 +313,12 @@ class InMemoryInvoiceRepository(InvoiceRepository):
                 return inv
         return None
 
+    def get_by_idempotency_key(self, *, idempotency_key: str) -> Invoice | None:
+        for record in self._invoices.values():
+            if record.idempotency_key == idempotency_key:
+                return record
+        return None
+
     def list_all(self) -> list[Invoice]:
         return list(self._invoices.values())
 
@@ -327,6 +339,12 @@ class InMemoryDispatchRepository(DispatchRepository):
         for disp in self._dispatches.values():
             if disp.order_id == order_id:
                 return disp
+        return None
+
+    def get_by_idempotency_key(self, *, idempotency_key: str) -> Dispatch | None:
+        for record in self._dispatches.values():
+            if record.idempotency_key == idempotency_key:
+                return record
         return None
 
     def list_all(self) -> list[Dispatch]:

@@ -12,7 +12,7 @@ from vaaniflow.domain.models.tool_execution import (
 from vaaniflow.domain.models.verification import Verification, VerificationStatus
 from vaaniflow.domain.policies.decision import Decision, DecisionType
 from vaaniflow.execution.approval import ApprovalService
-from vaaniflow.execution.tools.base import ToolContext, ToolResult
+from vaaniflow.execution.tools.base import Tool, ToolContext, ToolResult
 from vaaniflow.execution.tools.registry import ToolRegistry, create_default_registry
 from vaaniflow.execution.verifier import VerificationEngine
 from vaaniflow.infrastructure.repositories.synthetic_data import SyntheticRepositories
@@ -27,6 +27,8 @@ class ExecutionOutcome:
     verification: Verification | None
     tool_result: ToolResult
     message: str
+    # True when an UNKNOWN outcome was resolved to SUCCEEDED by read-back.
+    reconciled: bool = False
 
 
 class ExecutionService:
@@ -66,14 +68,52 @@ class ExecutionService:
         expected_state: dict[str, Any] | None = None,
         entity_type: str | None = None,
         metadata: dict[str, Any] | None = None,
+        retry_if_not_committed: bool = False,
         now: datetime | None = None,
     ) -> ExecutionOutcome:
+        """
+        Execute one tool call behind the policy, approval and idempotency gates.
+
+        A previous UNKNOWN execution with the same idempotency key is first
+        resolved by reading business state. The tool is invoked again only when
+        that read-back proves nothing was committed *and* the caller explicitly
+        passes ``retry_if_not_committed=True``; it is never retried blindly.
+        """
         current_time = now or datetime.now(UTC)
 
         # 1. Idempotency guard: Return prior execution if already recorded
         existing_execution = self._repositories.tool_executions.get_by_idempotency_key(
             idempotency_key=idempotency_key
         )
+        retry_of: ToolExecution | None = None
+        if (
+            existing_execution is not None
+            and existing_execution.status is ToolExecutionStatus.UNKNOWN
+        ):
+            unknown_tool = self._registry.get(existing_execution.tool_name)
+            if unknown_tool is not None:
+                resolved = self._resolve_unknown(
+                    tool=unknown_tool,
+                    execution=existing_execution,
+                    expected_state=expected_state,
+                    entity_type=entity_type,
+                    tool_result=ToolResult(
+                        success=False,
+                        outcome_unknown=True,
+                        error_code=existing_execution.error_code,
+                        error_message=existing_execution.error_message,
+                    ),
+                    now=current_time,
+                )
+                committed = self._committed_entity_id(
+                    unknown_tool.name, existing_execution.idempotency_key
+                )
+                if resolved.success or committed is not None or not retry_if_not_committed:
+                    return resolved
+                # Read-back proved nothing was committed: a retry cannot duplicate.
+                retry_of = existing_execution
+                existing_execution = None
+
         if existing_execution is not None:
             existing_verification = self._repositories.verifications.get_by_execution_id(
                 execution_id=existing_execution.execution_id
@@ -223,115 +263,290 @@ class ExecutionService:
                 )
 
         # 5. Tool Invocation
+        return self._invoke(
+            tool=tool,
+            run_id=run_id,
+            arguments=arguments,
+            idempotency_key=idempotency_key,
+            expected_state=expected_state,
+            entity_type=entity_type,
+            metadata=metadata or {},
+            attempt=retry_of.attempt + 1 if retry_of else 1,
+            now=current_time,
+            execution_id=retry_of.execution_id if retry_of else None,
+            prior=retry_of,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Invocation, verification and outcome resolution
+    # ------------------------------------------------------------------ #
+
+    def _invoke(
+        self,
+        *,
+        tool: Tool,
+        run_id: UUID,
+        arguments: dict[str, Any],
+        idempotency_key: str,
+        expected_state: dict[str, Any] | None,
+        entity_type: str | None,
+        metadata: dict[str, Any],
+        attempt: int,
+        now: datetime,
+        execution_id: UUID | None = None,
+        prior: ToolExecution | None = None,
+    ) -> ExecutionOutcome:
         context = ToolContext(
             run_id=run_id,
             repositories=self._repositories,
             idempotency_key=idempotency_key,
-            now=current_time,
-            metadata=metadata or {},
+            now=now,
+            metadata=metadata,
         )
+        execution_id = execution_id or uuid4()
+        is_write = tool.side_effect is not ToolSideEffect.READ_ONLY
 
-        tool_result = tool.execute(arguments=arguments, context=context)
-        finished_time = current_time
-        duration_ms = int((finished_time - current_time).total_seconds() * 1000)
-
-        # 6. Failure Handling (CLAUDE.md §2.6: Never Fake Success)
-        if not tool_result.success:
-            failed_execution = ToolExecution(
-                execution_id=uuid4(),
-                run_id=run_id,
-                tool_name=tool_name,
-                side_effect=tool.side_effect,
-                status=ToolExecutionStatus.FAILED,
-                idempotency_key=idempotency_key,
-                arguments=arguments,
-                error_code=tool_result.error_code,
-                error_message=tool_result.error_message,
-                started_at=current_time,
-                completed_at=finished_time,
-                duration_ms=duration_ms,
-            )
-            self._repositories.tool_executions.save(execution=failed_execution)
-
-            # Accurate message based on action
-            failure_message = self._derive_failure_message(tool_name, tool_result.error_message)
-
-            return ExecutionOutcome(
+        try:
+            tool_result = tool.execute(arguments=arguments, context=context)
+        except Exception as exc:  # noqa: BLE001 - recorded, never swallowed silently
+            # A write that raised may already have been committed: its outcome is
+            # unknown, not failed. A read that raised changed nothing.
+            tool_result = ToolResult(
                 success=False,
-                execution=failed_execution,
-                verification=None,
-                tool_result=tool_result,
-                message=failure_message,
+                outcome_unknown=is_write,
+                error_code="TOOL_EXCEPTION",
+                error_message=f"{type(exc).__name__}: {exc}",
             )
 
-        # 7. Read-Back Verification (CLAUDE.md §2.7 & §19)
-        verification: Verification | None = None
-        execution_id = uuid4()
-
-        if expected_state is not None:
-            detected_entity_type = entity_type or self._infer_entity_type(tool_name)
-            entity_id = self._extract_entity_id(tool_result.data, detected_entity_type)
-
-            if entity_id is not None:
-                verification = self._verifier.verify(
-                    run_id=run_id,
-                    execution_id=execution_id,
-                    entity_type=detected_entity_type,
-                    entity_id=entity_id,
-                    expected_state=expected_state,
-                    repositories=self._repositories,
-                    now=finished_time,
-                )
-
-        # Determine outcome based on verification
-        if verification is not None and verification.status != VerificationStatus.VERIFIED:
-            mismatches_str = "; ".join(verification.mismatches)
-            verified_failed_execution = ToolExecution(
+        def record(
+            status: ToolExecutionStatus,
+            *,
+            result: dict[str, Any] | None = None,
+            error_code: str | None = None,
+            error_message: str | None = None,
+        ) -> ToolExecution:
+            execution = ToolExecution(
                 execution_id=execution_id,
                 run_id=run_id,
-                tool_name=tool_name,
+                tool_name=tool.name,
                 side_effect=tool.side_effect,
-                status=ToolExecutionStatus.UNKNOWN,
+                status=status,
                 idempotency_key=idempotency_key,
                 arguments=arguments,
+                result=result,
+                error_code=error_code,
+                error_message=error_message,
+                attempt=attempt,
+                # A retry overwrites the UNKNOWN record; keep what it was.
+                prior_status=prior.status if prior else None,
+                prior_error_code=prior.error_code if prior else None,
+                prior_error_message=prior.error_message if prior else None,
+                started_at=now,
+                completed_at=now,
+                duration_ms=0,
+            )
+            self._repositories.tool_executions.save(execution=execution)
+            return execution
+
+        # 6a. Uncertain outcome: never reported as failed, never blindly retried.
+        if not tool_result.success and tool_result.outcome_unknown:
+            unknown = record(
+                ToolExecutionStatus.UNKNOWN,
+                error_code=tool_result.error_code,
+                error_message=tool_result.error_message,
+            )
+            return self._resolve_unknown(
+                tool=tool,
+                execution=unknown,
+                expected_state=expected_state,
+                entity_type=entity_type,
+                tool_result=tool_result,
+                now=now,
+            )
+
+        # 6b. Definite failure (CLAUDE.md §2.6: never fake success)
+        if not tool_result.success:
+            failed = record(
+                ToolExecutionStatus.FAILED,
+                error_code=tool_result.error_code,
+                error_message=tool_result.error_message,
+            )
+            return ExecutionOutcome(
+                success=False,
+                execution=failed,
+                verification=None,
+                tool_result=tool_result,
+                message=self._derive_failure_message(tool.name, tool_result.error_message),
+            )
+
+        # 7. Read-back verification (CLAUDE.md §2.7 & §19). Mandatory for writes.
+        verification: Verification | None = None
+        if expected_state is not None or is_write:
+            detected_entity_type = entity_type or self._infer_entity_type(tool.name)
+            entity_id = self._extract_entity_id(tool_result.data, detected_entity_type)
+            verification = self._read_back(
+                run_id=run_id,
+                execution_id=execution_id,
+                entity_type=detected_entity_type,
+                entity_id=entity_id,
+                expected_state=expected_state,
+                now=now,
+            )
+
+        if verification is not None and verification.status != VerificationStatus.VERIFIED:
+            mismatches_str = "; ".join(verification.mismatches)
+            unverified = record(
+                ToolExecutionStatus.UNKNOWN,
                 result=tool_result.data,
                 error_code="VERIFICATION_FAILED",
                 error_message=f"Read-back verification failed: {mismatches_str}",
-                started_at=current_time,
-                completed_at=finished_time,
-                duration_ms=duration_ms,
             )
-            self._repositories.tool_executions.save(execution=verified_failed_execution)
             return ExecutionOutcome(
                 success=False,
-                execution=verified_failed_execution,
+                execution=unverified,
                 verification=verification,
                 tool_result=tool_result,
                 message=f"Action completed by tool but failed verification: {mismatches_str}",
             )
 
-        # Success path
-        successful_execution = ToolExecution(
-            execution_id=execution_id,
-            run_id=run_id,
-            tool_name=tool_name,
-            side_effect=tool.side_effect,
-            status=ToolExecutionStatus.SUCCEEDED,
-            idempotency_key=idempotency_key,
-            arguments=arguments,
-            result=tool_result.data,
-            started_at=current_time,
-            completed_at=finished_time,
-            duration_ms=duration_ms,
-        )
-        self._repositories.tool_executions.save(execution=successful_execution)
-
+        succeeded = record(ToolExecutionStatus.SUCCEEDED, result=tool_result.data)
         return ExecutionOutcome(
             success=True,
-            execution=successful_execution,
+            execution=succeeded,
             verification=verification,
             tool_result=tool_result,
-            message=self._derive_success_message(tool_name, tool_result.data),
+            message=self._derive_success_message(tool.name, tool_result.data),
+        )
+
+    def _read_back(
+        self,
+        *,
+        run_id: UUID,
+        execution_id: UUID,
+        entity_type: str,
+        entity_id: UUID | None,
+        expected_state: dict[str, Any] | None,
+        now: datetime,
+    ) -> Verification:
+        if expected_state is None or entity_id is None:
+            problem = (
+                "No expected state was supplied for a state-changing tool."
+                if expected_state is None
+                else f"The tool result does not identify the {entity_type} it wrote."
+            )
+            verification = Verification(
+                verification_id=uuid4(),
+                run_id=run_id,
+                execution_id=execution_id,
+                status=VerificationStatus.UNVERIFIED,
+                expected_state=expected_state or {},
+                actual_state={},
+                mismatches=[problem],
+                verifier_version=self._verifier.VERSION,
+            )
+            self._repositories.verifications.save(verification=verification)
+            return verification
+        return self._verifier.verify(
+            run_id=run_id,
+            execution_id=execution_id,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            expected_state=expected_state,
+            repositories=self._repositories,
+            now=now,
+        )
+
+    def _committed_entity_id(self, tool_name: str, idempotency_key: str) -> UUID | None:
+        """Find the record a write created under this idempotency key, if any."""
+        repos = self._repositories
+        if tool_name == "create_order":
+            order = repos.orders.get_by_idempotency_key(idempotency_key=idempotency_key)
+            return order.order_id if order else None
+        if tool_name == "create_invoice_draft":
+            invoice = repos.invoices.get_by_idempotency_key(idempotency_key=idempotency_key)
+            return invoice.invoice_id if invoice else None
+        if tool_name == "dispatch_order":
+            dispatch = repos.dispatches.get_by_idempotency_key(idempotency_key=idempotency_key)
+            return dispatch.dispatch_id if dispatch else None
+        return None
+
+    def _resolve_unknown(
+        self,
+        *,
+        tool: Tool,
+        execution: ToolExecution,
+        expected_state: dict[str, Any] | None,
+        entity_type: str | None,
+        tool_result: ToolResult,
+        now: datetime,
+    ) -> ExecutionOutcome:
+        """
+        Resolve an UNKNOWN outcome by reading business state, never by re-invoking.
+
+        Committed and verified -> SUCCEEDED (reconciled). Absent or not
+        verifiable -> stays UNKNOWN; the caller must not report success or failure.
+        """
+        detected_entity_type = entity_type or self._infer_entity_type(tool.name)
+        entity_id = self._committed_entity_id(tool.name, execution.idempotency_key)
+        if entity_id is None:
+            return ExecutionOutcome(
+                success=False,
+                execution=execution,
+                verification=None,
+                tool_result=tool_result,
+                message=(
+                    f"Outcome of {tool.name} is unknown: {execution.error_message} "
+                    "No committed record was found under its idempotency key. "
+                    "It was not retried automatically."
+                ),
+            )
+
+        verification = self._read_back(
+            run_id=execution.run_id,
+            execution_id=execution.execution_id,
+            entity_type=detected_entity_type,
+            entity_id=entity_id,
+            expected_state=expected_state,
+            now=now,
+        )
+        if verification.status is not VerificationStatus.VERIFIED:
+            return ExecutionOutcome(
+                success=False,
+                execution=execution,
+                verification=verification,
+                tool_result=tool_result,
+                message=(
+                    f"Outcome of {tool.name} is unknown: a record exists under its idempotency "
+                    f"key but does not verify ({'; '.join(verification.mismatches)})."
+                ),
+            )
+
+        data = dict(verification.actual_state)
+        reconciled = execution.model_copy(
+            update={
+                "status": ToolExecutionStatus.SUCCEEDED,
+                "result": data,
+                "error_code": None,
+                "error_message": None,
+                "completed_at": now,
+                # The record keeps that this outcome was once UNKNOWN, and why.
+                "reconciled": True,
+                "prior_status": execution.status,
+                "prior_error_code": execution.error_code,
+                "prior_error_message": execution.error_message,
+            }
+        )
+        self._repositories.tool_executions.save(execution=reconciled)
+        return ExecutionOutcome(
+            success=True,
+            execution=reconciled,
+            verification=verification,
+            tool_result=ToolResult(success=True, data=data),
+            message=(
+                f"{tool.name} did not respond, but read-back found its committed record "
+                f"and verified it. {self._derive_success_message(tool.name, data)}"
+            ),
+            reconciled=True,
         )
 
     def _derive_failure_message(self, tool_name: str, error_message: str | None) -> str:

@@ -51,6 +51,14 @@ class ToolExecution(DomainSchema):
     error_message: str | None = None
 
     attempt: int = Field(default=1, ge=1)
+
+    # Audit history of an earlier UNKNOWN outcome for this same execution. The
+    # status above always reflects the evidenced business outcome; these fields
+    # keep the record of the uncertainty that preceded it.
+    reconciled: bool = False  # resolved by read-back of business state, not re-invoked
+    prior_status: ToolExecutionStatus | None = None
+    prior_error_code: str | None = None
+    prior_error_message: str | None = None
     duration_ms: int | None = Field(default=None, ge=0)
 
     started_at: datetime

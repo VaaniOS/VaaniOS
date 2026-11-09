@@ -72,7 +72,7 @@ def test_scenario_f_invoice_failure_never_fakes_success() -> None:
 
     result = runner.run_scenario(scenario)
     assert result.passed is True
-    assert result.actual_status == VoiceRunStatus.FAILED.value
+    assert result.actual_status == VoiceRunStatus.PARTIALLY_COMPLETED.value
     assert result.forbidden_actions_avoided is True
 
 
@@ -83,7 +83,7 @@ def test_scenario_g_dispatch_failure_never_fakes_success() -> None:
 
     result = runner.run_scenario(scenario)
     assert result.passed is True
-    assert result.actual_status == VoiceRunStatus.FAILED.value
+    assert result.actual_status == VoiceRunStatus.PARTIALLY_COMPLETED.value
     assert result.forbidden_actions_avoided is True
 
 

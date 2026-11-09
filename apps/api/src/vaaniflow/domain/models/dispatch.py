@@ -31,6 +31,9 @@ class Dispatch(DomainSchema):
 
     status: DispatchStatus
 
+    # Key of the write that created this record; used to reconcile UNKNOWN outcomes.
+    idempotency_key: str | None = None
+
     recipient_name: str | None = None
     delivery_address: str | None = None
 

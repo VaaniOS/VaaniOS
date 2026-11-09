@@ -19,6 +19,7 @@ import hashlib
 import json
 from datetime import datetime
 from decimal import Decimal
+from enum import StrEnum
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -86,6 +87,67 @@ class PendingExecution(DomainSchema):
     plan: ExecutionPlan
     understand_result: UnderstandResult
     created_at: datetime
+
+
+class StepStatus(StrEnum):
+    """Outcome of one planned tool call, as established by evidence."""
+
+    VERIFIED = "VERIFIED"  # executed and confirmed by read-back of business state
+    FAILED = "FAILED"  # definitively not performed
+    UNKNOWN = "UNKNOWN"  # may or may not have happened, or could not be verified
+    NOT_ATTEMPTED = "NOT_ATTEMPTED"  # skipped because an earlier step did not verify
+
+
+class StepOutcome(DomainSchema):
+    """Per-tool result of executing an approved plan. Never flattened away."""
+
+    tool_name: str = Field(min_length=1)
+    status: StepStatus
+    execution_status: str | None = None
+    verification_status: str | None = None
+    entity_id: str | None = None
+    error_code: str | None = None
+    message: str = Field(min_length=1)
+    reconciled: bool = False
+
+
+def expected_state_for(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    """
+    Business state a write must leave behind, derived only from the approved
+    plan arguments. Read-back verification compares the stored record with it.
+    """
+    items = arguments.get("items", [])
+    if tool_name == "create_order":
+        expected: dict[str, Any] = {
+            "customer_id": arguments["customer_id"],
+            "currency": arguments["currency"],
+            "items_count": len(items),
+            "subtotal": str(sum(Decimal(str(i["line_total"])) for i in items)),
+            "status": "DRAFT",
+        }
+        if arguments.get("delivery_address"):
+            expected["delivery_address"] = arguments["delivery_address"]
+        return expected
+    if tool_name == "create_invoice_draft":
+        return {
+            "order_id": arguments["order_id"],
+            "customer_id": arguments["customer_id"],
+            "currency": arguments["currency"],
+            "subtotal": arguments["subtotal"],
+            "tax_total": arguments["tax_total"],
+            "total": arguments["total"],
+            "items_count": len(items),
+            "status": "DRAFT",
+        }
+    if tool_name == "dispatch_order":
+        return {
+            "order_id": arguments["order_id"],
+            "customer_id": arguments["customer_id"],
+            "warehouse_id": arguments["warehouse_id"],
+            "delivery_address": arguments["delivery_address"],
+            "status": "DISPATCHED",
+        }
+    raise PlanningError(f"No read-back contract is defined for tool '{tool_name}'.")
 
 
 def split_actions(
@@ -212,6 +274,8 @@ def _tool_calls(
         raise PlanningError("Product is not uniquely resolved against the catalog.")
     if business_context.resolved_price is None:
         raise PlanningError("No unit price was resolved from business records.")
+    if business_context.resolved_price.source_quote_id is None:
+        raise PlanningError("The unit price is not backed by a business quote.")
 
     quantity = semantic_state.items[0].quantity
     if quantity is None or quantity.unit is None:

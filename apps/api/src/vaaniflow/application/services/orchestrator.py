@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -13,7 +14,9 @@ from vaaniflow.context.models.business_context import BusinessContext
 from vaaniflow.context.service import ContextResolutionOutput, ContextResolutionService
 from vaaniflow.domain.models.approval import Approval, ApprovalStatus
 from vaaniflow.domain.models.handoff import HandoffCase
+from vaaniflow.domain.models.tool_execution import ToolExecutionStatus
 from vaaniflow.domain.models.validation import ValidationResult
+from vaaniflow.domain.models.verification import VerificationStatus
 from vaaniflow.domain.models.voice_run import VoiceRun, VoiceRunStatus
 from vaaniflow.domain.policies.decision import Decision, DecisionReasonCode, DecisionType
 from vaaniflow.domain.policies.risk import RiskAssessment
@@ -27,8 +30,11 @@ from vaaniflow.execution.plan import (
     ExecutionPlan,
     PendingExecution,
     PlanningError,
+    StepOutcome,
+    StepStatus,
     build_plan,
     business_snapshot_version,
+    expected_state_for,
 )
 from vaaniflow.execution.service import ExecutionOutcome, ExecutionService
 from vaaniflow.handoff.service import HandoffService
@@ -44,7 +50,12 @@ from vaaniflow.validation.engine import ValidationEngine
 # PARTIAL references ACT can ground against business records (historical quotes).
 _RESOLVABLE_REFERENCES = frozenset({ReferenceType.HISTORICAL_PRICE, ReferenceType.HISTORICAL_QUOTE})
 
-_EXPECTED_STATE_ENTITY = {"dispatch_order": "dispatch"}
+# Result key identifying the business record each write tool creates.
+_ENTITY_ID_KEY = {
+    "create_order": "order_id",
+    "create_invoice_draft": "invoice_id",
+    "dispatch_order": "dispatch_id",
+}
 
 
 class ApprovalFlowError(Exception):
@@ -73,6 +84,16 @@ class WorkflowResult:
     snapshot_version: str | None = None
     plan: ExecutionPlan | None = None
     executed_tools: list[str] = field(default_factory=list)
+    # Per-tool outcomes of an executed plan (VERIFIED / FAILED / UNKNOWN / NOT_ATTEMPTED).
+    step_outcomes: list[StepOutcome] = field(default_factory=list)
+    # Earlier pending approvals of this run that this instruction superseded.
+    superseded_approval_ids: list[UUID] = field(default_factory=list)
+
+    @property
+    def all_steps_verified(self) -> bool | None:
+        if not self.step_outcomes:
+            return None
+        return all(step.status is StepStatus.VERIFIED for step in self.step_outcomes)
 
 
 @dataclass
@@ -112,8 +133,11 @@ class VoiceWorkflowOrchestrator:
         trace_service: TraceService | None = None,
         preprocess_audio_service: PreprocessAudioService | None = None,
         transcribe_audio_service: TranscribeAudioService | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.repositories = repositories
+        # Business clock; injectable so validity windows are testable deterministically.
+        self.clock: Callable[[], datetime] = clock or (lambda: datetime.now(UTC))
         self.compiler = compiler or SemanticCompiler()
         self.evaluator = evaluator or InputEvaluator()
         self.context_resolver = context_resolver or ContextResolutionService(
@@ -140,7 +164,7 @@ class VoiceWorkflowOrchestrator:
 
     def start_run(self, *, run_id: UUID | None = None, now: datetime | None = None) -> VoiceRun:
         """Create and persist a new VoiceRun aggregate."""
-        t = now or datetime.now(UTC)
+        t = now or self.clock()
         run = VoiceRun(
             run_id=run_id or uuid4(),
             status=VoiceRunStatus.CREATED,
@@ -169,11 +193,22 @@ class VoiceWorkflowOrchestrator:
         This never executes a business write: writes are planned, persisted and
         returned as an approval request that must be approved via approve().
         """
-        t = now or datetime.now(UTC)
+        t = now or self.clock()
         run = self.repositories.runs.get_by_id(run_id=run_id) if run_id else None
         if run is None:
             run = self.start_run(run_id=run_id, now=t)
         self._set_status(run, VoiceRunStatus.PROCESSING, t)
+
+        # 0. A new instruction on this run replaces any plan still awaiting
+        #    approval: at most one executable REQUESTED approval per run.
+        superseded = self._supersede_pending_approvals(run, now=t)
+
+        result = self._process(text=text, run=run, now=t)
+        result.superseded_approval_ids = superseded
+        return result
+
+    def _process(self, *, text: str, run: VoiceRun, now: datetime) -> WorkflowResult:
+        t = now
 
         # 1. UNDERSTAND
         understand_result = self._understand(text=text, run=run, now=t)
@@ -423,13 +458,17 @@ class VoiceWorkflowOrchestrator:
         if the decision, the plan or the business snapshot changed, the
         approval expires and nothing executes.
         """
-        t = now or datetime.now(UTC)
+        t = now or self.clock()
         run, pending, approval = self._pending_approval(run_id=run_id, approval_id=approval_id)
         plan = pending.plan
         understand_result = pending.understand_result
 
         act = self._assess(
-            semantic_state=understand_result.semantic_state, run=run, is_approved=True, now=t
+            semantic_state=understand_result.semantic_state,
+            run=run,
+            is_approved=True,
+            now=t,
+            utterance_time=understand_result.transcript.created_at,
         )
         try:
             current_plan = build_plan(
@@ -508,7 +547,7 @@ class VoiceWorkflowOrchestrator:
         now: datetime | None = None,
     ) -> WorkflowResult:
         """Reject a pending approval of this run. Its plan can never execute."""
-        t = now or datetime.now(UTC)
+        t = now or self.clock()
         run, pending, approval = self._pending_approval(run_id=run_id, approval_id=approval_id)
         approval = self.approval_service.reject(
             approval_id=approval.approval_id, rejected_by=rejected_by, now=t
@@ -530,6 +569,25 @@ class VoiceWorkflowOrchestrator:
             message=run.failure_message,
         )
 
+    def _supersede_pending_approvals(self, run: VoiceRun, *, now: datetime) -> list[UUID]:
+        superseded: list[UUID] = []
+        for pending in self.repositories.pending_executions.list_by_run(run_id=run.run_id):
+            approval = self.repositories.approvals.get_by_id(approval_id=pending.approval_id)
+            if approval is None or approval.status is not ApprovalStatus.REQUESTED:
+                continue
+            self.approval_service.supersede(approval_id=approval.approval_id, now=now)
+            superseded.append(approval.approval_id)
+            self.trace_service.record_stage(
+                run_id=run.run_id,
+                stage=TraceStage.APPROVAL_SUPERSEDED,
+                output_summary=(
+                    f"Approval {approval.approval_id} (plan {pending.plan.plan_id}) superseded "
+                    "by a new instruction on this run; it can no longer execute."
+                ),
+                timestamp=now,
+            )
+        return superseded
+
     def _pending_approval(
         self, *, run_id: UUID, approval_id: UUID
     ) -> tuple[VoiceRun, PendingExecution, Approval]:
@@ -543,6 +601,12 @@ class VoiceWorkflowOrchestrator:
         if pending.plan.run_id != run.run_id:
             raise ApprovalFlowError(
                 "APPROVAL_RUN_MISMATCH", f"Approval {approval_id} does not belong to run {run_id}."
+            )
+        if approval.status is ApprovalStatus.SUPERSEDED:
+            raise ApprovalFlowError(
+                "APPROVAL_SUPERSEDED",
+                f"Approval {approval_id} was superseded by a newer instruction on run "
+                f"{run_id}. Nothing was executed.",
             )
         if approval.status is not ApprovalStatus.REQUESTED:
             raise ApprovalFlowError(
@@ -566,21 +630,38 @@ class VoiceWorkflowOrchestrator:
         simulated_faults: dict[str, Any],
         now: datetime,
     ) -> WorkflowResult:
+        """
+        Execute the approved plan step by step and report each step's evidence.
+
+        A step counts as done only when read-back verified it. The first step
+        that does not verify stops the plan; later steps are NOT_ATTEMPTED.
+        Nothing is rolled back and no rollback is claimed.
+        """
+        steps: list[StepOutcome] = []
         executed: list[str] = []
         order_id: str | None = None
         outcome: ExecutionOutcome | None = None
+        stopped: ExecutionOutcome | None = None
+        metadata = {
+            "simulate_invoice_failure": bool(simulated_faults.get("simulate_invoice_failure")),
+            "simulate_dispatch_failure": bool(simulated_faults.get("simulate_dispatch_failure")),
+            "simulate_timeout": dict(simulated_faults.get("simulate_timeout") or {}),
+        }
 
         for call in plan.tool_calls:
+            if stopped is not None:
+                steps.append(
+                    StepOutcome(
+                        tool_name=call.tool_name,
+                        status=StepStatus.NOT_ATTEMPTED,
+                        message=f"Not attempted: {stopped.execution.tool_name} did not verify.",
+                    )
+                )
+                continue
+
             arguments = dict(call.arguments)
             if call.depends_on_order:
                 arguments["order_id"] = order_id
-            expected_state = None
-            entity_type = _EXPECTED_STATE_ENTITY.get(call.tool_name)
-            if call.tool_name == "dispatch_order":
-                expected_state = {
-                    "status": "DISPATCHED",
-                    "warehouse_id": arguments["warehouse_id"],
-                }
 
             outcome = self.execution_service.execute(
                 run_id=run.run_id,
@@ -590,50 +671,121 @@ class VoiceWorkflowOrchestrator:
                 decision=act.decision,
                 approval=approval,
                 current_snapshot_version=plan.snapshot_version,
-                expected_state=expected_state,
-                entity_type=entity_type,
-                metadata={
-                    "simulate_invoice_failure": bool(
-                        simulated_faults.get("simulate_invoice_failure")
-                    ),
-                    "simulate_dispatch_failure": bool(
-                        simulated_faults.get("simulate_dispatch_failure")
-                    ),
-                },
+                expected_state=expected_state_for(call.tool_name, arguments),
+                metadata=metadata,
                 now=now,
             )
+            step = self._step_outcome(call.tool_name, outcome)
+            steps.append(step)
+            self.trace_service.record_stage(
+                run_id=run.run_id,
+                stage=TraceStage.VERIFIED
+                if step.status is StepStatus.VERIFIED
+                else TraceStage.TOOL_EXECUTED,
+                tool_name=call.tool_name,
+                output_summary=(
+                    f"{call.tool_name}: {step.status.value} "
+                    f"(execution={step.execution_status}, verification={step.verification_status})"
+                    + (
+                        f"; reconciled by read-back after UNKNOWN ({outcome.execution.prior_error_code})"
+                        if step.reconciled
+                        else ""
+                    )
+                ),
+                error_code=step.error_code,
+                timestamp=now,
+            )
 
-            if not outcome.success:
-                run.failure_code = outcome.tool_result.error_code
-                run.failure_message = outcome.message
-                self._set_status(run, VoiceRunStatus.FAILED, now)
+            if step.status is StepStatus.VERIFIED:
+                executed.append(call.tool_name)
+                if call.tool_name == "create_order":
+                    order_id = outcome.tool_result.data["order_id"]
+            else:
+                stopped = outcome
+
+        def result(**kwargs: Any) -> WorkflowResult:
+            return self._result(
+                run,
+                understand_result,
+                act=act,
+                approval=approval,
+                plan=plan,
+                outcome=outcome,
+                executed=executed,
+                steps=steps,
+                **kwargs,
+            )
+
+        unsupported = ", ".join(a.value for a in plan.unsupported_actions)
+        not_performed = (
+            f" Not performed (unsupported, handed to operator): {unsupported}."
+            if unsupported
+            else ""
+        )
+
+        if stopped is not None:
+            summary = self._step_summary(steps)
+            unknown = [s for s in steps if s.status is StepStatus.UNKNOWN]
+            run.failure_code = stopped.execution.error_code or stopped.tool_result.error_code
+            run.failure_message = stopped.message
+
+            if unknown:
+                # The business state is uncertain: a person must establish it
+                # before anything else happens. Nothing is retried or reported done.
+                run.failure_code = "OUTCOME_UNKNOWN"
+                handoff_case = self.handoff_service.create_case(
+                    run_id=run.run_id,
+                    reason=(
+                        f"Outcome of {', '.join(s.tool_name for s in unknown)} is unknown "
+                        "after an uncertain tool response; not retried automatically."
+                    ),
+                    original_request=understand_result.transcript.text,
+                    blocked_actions=[
+                        s.tool_name for s in steps if s.status is not StepStatus.VERIFIED
+                    ]
+                    + [a.value for a in plan.unsupported_actions],
+                    attempted_actions=[
+                        s.tool_name for s in steps if s.status is not StepStatus.NOT_ATTEMPTED
+                    ],
+                    recommended_action=(
+                        "Check the business system for the unknown operation before "
+                        "re-approving; do not repeat it blindly."
+                    ),
+                    now=now,
+                )
+                self._set_status(run, VoiceRunStatus.HANDOFF, now)
                 self.trace_service.record_stage(
                     run_id=run.run_id,
-                    stage=TraceStage.FAILED,
-                    tool_name=call.tool_name,
-                    error_code=outcome.tool_result.error_code,
-                    error_message=outcome.message,
+                    stage=TraceStage.HANDOFF_CREATED,
+                    error_code="OUTCOME_UNKNOWN",
+                    output_summary=summary,
                     timestamp=now,
                 )
-                done = f" Completed before the failure: {', '.join(executed)}." if executed else ""
-                return self._result(
-                    run,
-                    understand_result,
-                    act=act,
-                    approval=approval,
-                    plan=plan,
-                    outcome=outcome,
-                    executed=executed,
-                    message=outcome.message + done,
+                return result(
+                    handoff_case=handoff_case,
+                    message=f"Outcome unknown; handed to operator. {summary}{not_performed}",
                 )
 
-            executed.append(call.tool_name)
-            if call.tool_name == "create_order":
-                order_id = outcome.tool_result.data["order_id"]
+            status = VoiceRunStatus.PARTIALLY_COMPLETED if executed else VoiceRunStatus.FAILED
+            self._set_status(run, status, now)
+            self.trace_service.record_stage(
+                run_id=run.run_id,
+                stage=TraceStage.FAILED,
+                tool_name=stopped.execution.tool_name,
+                error_code=run.failure_code,
+                error_message=stopped.message,
+                output_summary=summary,
+                timestamp=now,
+            )
+            prefix = (
+                "Partially completed; nothing was rolled back."
+                if executed
+                else "Nothing was completed."
+            )
+            return result(message=f"{stopped.message} {prefix} {summary}{not_performed}")
 
-        summary = f"Executed approved plan: {', '.join(executed)}."
+        summary = f"Executed and verified approved plan: {', '.join(executed)}."
         if plan.unsupported_actions:
-            unsupported = ", ".join(a.value for a in plan.unsupported_actions)
             handoff_case = self.handoff_service.create_case(
                 run_id=run.run_id,
                 reason=f"Requested actions not supported by the system: {unsupported}.",
@@ -650,17 +802,7 @@ class VoiceWorkflowOrchestrator:
                 output_summary=f"{summary} Unsupported actions handed off: {unsupported}",
                 timestamp=now,
             )
-            return self._result(
-                run,
-                understand_result,
-                act=act,
-                approval=approval,
-                plan=plan,
-                outcome=outcome,
-                executed=executed,
-                handoff_case=handoff_case,
-                message=f"{summary} Not performed (unsupported, handed to operator): {unsupported}.",
-            )
+            return result(handoff_case=handoff_case, message=f"{summary}{not_performed}")
 
         self._set_status(run, VoiceRunStatus.COMPLETED, now)
         self.trace_service.record_stage(
@@ -669,15 +811,50 @@ class VoiceWorkflowOrchestrator:
             output_summary=summary,
             timestamp=now,
         )
-        return self._result(
-            run,
-            understand_result,
-            act=act,
-            approval=approval,
-            plan=plan,
-            outcome=outcome,
-            executed=executed,
-            message=summary,
+        return result(message=summary)
+
+    @staticmethod
+    def _step_outcome(tool_name: str, outcome: ExecutionOutcome) -> StepOutcome:
+        execution = outcome.execution
+        verification = outcome.verification
+        if (
+            outcome.success
+            and verification is not None
+            and verification.status is VerificationStatus.VERIFIED
+        ):
+            status = StepStatus.VERIFIED
+        elif execution.status is ToolExecutionStatus.FAILED:
+            status = StepStatus.FAILED
+        else:
+            # Tool outcome UNKNOWN, or acknowledged but not verified by read-back.
+            status = StepStatus.UNKNOWN
+        entity_id = outcome.tool_result.data.get(_ENTITY_ID_KEY.get(tool_name, ""))
+        return StepOutcome(
+            tool_name=tool_name,
+            status=status,
+            execution_status=execution.status.value,
+            verification_status=verification.status.value if verification else None,
+            entity_id=str(entity_id) if entity_id else None,
+            error_code=execution.error_code or outcome.tool_result.error_code,
+            message=outcome.message,
+            reconciled=outcome.reconciled,
+        )
+
+    @staticmethod
+    def _step_summary(steps: list[StepOutcome]) -> str:
+        groups: dict[StepStatus, list[str]] = {}
+        for step in steps:
+            groups.setdefault(step.status, []).append(step.tool_name)
+        labels = {
+            StepStatus.VERIFIED: "Verified",
+            StepStatus.FAILED: "Failed",
+            StepStatus.UNKNOWN: "Outcome unknown",
+            StepStatus.NOT_ATTEMPTED: "Not attempted",
+        }
+        return " ".join(
+            f"{labels[status]}: {', '.join(groups[status])}."
+            for status in labels
+            if status in groups
         )
 
     def _finish_without_writes(
@@ -820,9 +997,14 @@ class VoiceWorkflowOrchestrator:
         run: VoiceRun,
         is_approved: bool,
         now: datetime,
+        utterance_time: datetime | None = None,
     ) -> _ActAssessment:
+        # Relative dates resolve against when the user spoke; validity against now.
         context = self.context_resolver.resolve(
-            semantic_state=semantic_state, run_id=run.run_id, run_timestamp=now
+            semantic_state=semantic_state,
+            run_id=run.run_id,
+            run_timestamp=now,
+            utterance_timestamp=utterance_time,
         )
         snapshot_version = business_snapshot_version(
             context.business_context, context.tax_calculation
@@ -969,6 +1151,7 @@ class VoiceWorkflowOrchestrator:
         plan: ExecutionPlan | None = None,
         outcome: ExecutionOutcome | None = None,
         executed: list[str] | None = None,
+        steps: list[StepOutcome] | None = None,
     ) -> WorkflowResult:
         return WorkflowResult(
             run=run,
@@ -984,6 +1167,7 @@ class VoiceWorkflowOrchestrator:
             snapshot_version=plan.snapshot_version if plan else None,
             plan=plan,
             executed_tools=executed or [],
+            step_outcomes=steps or [],
         )
 
     # ------------------------------------------------------------------ #
@@ -998,7 +1182,7 @@ class VoiceWorkflowOrchestrator:
         now: datetime | None = None,
     ) -> WorkflowResult:
         """Process an audio artifact by running preprocessor + ASR then delegating to pipeline."""
-        t = now or datetime.now(UTC)
+        t = now or self.clock()
         run = self.start_run(run_id=run_id, now=t)
         run.audio_artifact_id = artifact.artifact_id
 

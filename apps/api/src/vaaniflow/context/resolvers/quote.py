@@ -1,5 +1,6 @@
 from datetime import date, datetime
-from uuid import uuid4
+from typing import Protocol
+from uuid import UUID, uuid4
 
 from vaaniflow.application.ports.business_data import QuoteRepository
 from vaaniflow.context.models.business_context import (
@@ -13,7 +14,7 @@ from vaaniflow.context.models.resolution import (
     ResolutionResult,
     ResolutionStatus,
 )
-from vaaniflow.domain.models.quote import Quote, QuoteStatus
+from vaaniflow.domain.models.quote import Quote
 from vaaniflow.domain.schemas.common import Confidence, ConfidenceSource
 from vaaniflow.domain.schemas.semantic import (
     PriceSource,
@@ -22,14 +23,40 @@ from vaaniflow.domain.schemas.semantic import (
     SemanticReference,
 )
 
+HISTORICAL_REFERENCE_TYPES = frozenset(
+    {ReferenceType.HISTORICAL_PRICE, ReferenceType.HISTORICAL_QUOTE}
+)
+
+_Resolution = tuple[ResolutionResult, ResolvedQuote | None, ResolvedPrice | None]
+
+
+class _ResultFactory(Protocol):
+    """Signature of the per-resolution result() builder."""
+
+    def __call__(
+        self,
+        status: ResolutionStatus,
+        reason: str,
+        *,
+        entity_type: str = "quote",
+        selected: UUID | None = None,
+        candidates: list[ResolutionCandidate] | None = None,
+    ) -> ResolutionResult: ...
+
 
 class PriceQuoteResolver:
     """
-    Deterministic historical quote and price resolver.
+    Deterministic quote and price resolver (System-Design 06 §6.6).
 
-    Resolves historical quote references (e.g., 'Rate wahi jo parso bataya tha')
-    against business quote records. Compares spoken price claims against
-    authoritative business quotes and prevents applying expired or mismatched quotes.
+    Pricing authority rule: the only business-authoritative execution price is
+    the unit price of exactly one quote for the resolved customer and product
+    that is applicable on the business date (status VALID and the business
+    date inside [quoted_on, valid_until]). A spoken amount is a claim that is
+    compared with that quote; it never becomes the price on its own.
+
+    A historical reference ("rate wahi jo parso bataya tha") is constrained by
+    the temporal expression the semantic layer linked to it: only quotes given
+    on that date are candidates. If none exists, no other date is substituted.
     """
 
     def __init__(self, quote_repo: QuoteRepository) -> None:
@@ -44,229 +71,251 @@ class PriceQuoteResolver:
         references: list[SemanticReference],
         resolved_date: date | None,
         resolved_at: datetime,
-    ) -> tuple[ResolutionResult, ResolvedQuote | None, ResolvedPrice | None]:
+        business_date: date | None = None,
+        anchor_surface: str | None = None,
+        anchor_unresolved: str | None = None,
+    ) -> _Resolution:
+        """
+        Args:
+            resolved_date: calendar date of the temporal expression linked to
+                the historical price reference (e.g. "parso"), if any.
+            business_date: date on which the transaction would execute; quote
+                validity is checked against it (defaults to resolved_at's date).
+            anchor_surface: surface text of the linked temporal expression.
+            anchor_unresolved: set when the reference is linked to a temporal
+                expression that could not be resolved to a date.
+        """
         resolution_id = uuid4()
+        today = business_date or resolved_at.date()
         primary_price = pricing[0] if pricing else None
+        spoken_amount = primary_price.amount if primary_price else None
 
-        # Check if a historical price/quote reference exists
         has_historical_ref = any(
-            ref.reference_type in {ReferenceType.HISTORICAL_PRICE, ReferenceType.HISTORICAL_QUOTE}
-            for ref in references
+            ref.reference_type in HISTORICAL_REFERENCE_TYPES for ref in references
         ) or (
             primary_price is not None
             and primary_price.source
-            in {
-                PriceSource.HISTORICAL_REFERENCE,
-                PriceSource.SPOKEN_WITH_HISTORICAL_REFERENCE,
-            }
+            in {PriceSource.HISTORICAL_REFERENCE, PriceSource.SPOKEN_WITH_HISTORICAL_REFERENCE}
         )
-
         query = primary_price.surface_text if primary_price else "historical_rate"
 
-        # If there is no historical reference and pricing is purely spoken
-        if not has_historical_ref:
-            if (
-                primary_price is not None
-                and primary_price.amount is not None
-                and product is not None
-                and customer is not None
-            ):
-                resolved_price = ResolvedPrice(
-                    product_id=product.product.product_id,
-                    customer_id=customer.customer.customer_id,
-                    unit=primary_price.per_unit or product.product.unit,
-                    unit_price=primary_price.amount,
-                    currency=primary_price.currency or "INR",
-                    source_quote_id=None,
-                    resolved_on=resolved_date or resolved_at.date(),
-                )
-                candidate = ResolutionCandidate(
-                    candidate_id=uuid4(),
-                    entity_id=uuid4(),
-                    display_name=f"Direct spoken price {primary_price.amount} {primary_price.currency or 'INR'}",
-                    confidence=Confidence(score=0.90, source=ConfidenceSource.RULE),
-                    evidence=["Spoken price without historical quote reference"],
-                )
-                return (
-                    ResolutionResult(
-                        resolution_id=resolution_id,
-                        entity_type="price",
-                        status=ResolutionStatus.RESOLVED,
-                        query=query,
-                        selected_entity_id=candidate.entity_id,
-                        candidates=[candidate],
-                        reason="Direct spoken price accepted for evaluation.",
-                    ),
-                    None,
-                    resolved_price,
-                )
+        def result(
+            status: ResolutionStatus,
+            reason: str,
+            *,
+            entity_type: str = "quote",
+            selected: UUID | None = None,
+            candidates: list[ResolutionCandidate] | None = None,
+        ) -> ResolutionResult:
+            return ResolutionResult(
+                resolution_id=resolution_id,
+                entity_type=entity_type,
+                status=status,
+                query=query,
+                selected_entity_id=selected,
+                candidates=candidates or [],
+                reason=reason,
+            )
 
+        if not has_historical_ref and spoken_amount is None:
             return (
-                ResolutionResult(
-                    resolution_id=resolution_id,
+                result(
+                    ResolutionStatus.NOT_FOUND,
+                    "No pricing instruction or reference found in semantic state.",
                     entity_type="price",
-                    status=ResolutionStatus.NOT_FOUND,
-                    query=query,
-                    selected_entity_id=None,
-                    candidates=[],
-                    reason="No pricing instruction or reference found in semantic state.",
                 ),
                 None,
                 None,
             )
 
-        # Historical reference requires resolved customer and product
         if customer is None or product is None:
             return (
-                ResolutionResult(
-                    resolution_id=resolution_id,
-                    entity_type="quote",
-                    status=ResolutionStatus.INVALID,
-                    query=query,
-                    selected_entity_id=None,
-                    candidates=[],
-                    reason="Cannot resolve historical quote without a resolved customer and product.",
+                result(
+                    ResolutionStatus.INVALID,
+                    "Cannot resolve a price without a resolved customer and product.",
                 ),
                 None,
                 None,
             )
 
-        # Lookup quotes for customer and product
+        names = f"customer '{customer.customer.name}' and product '{product.product.name}'"
         quotes = self._quote_repo.find_quotes(
             customer_id=customer.customer.customer_id,
             product_id=product.product.product_id,
         )
 
-        if not quotes:
+        if has_historical_ref:
+            if anchor_unresolved is not None:
+                return (
+                    result(
+                        ResolutionStatus.INVALID,
+                        f"The referenced rate is tied to '{anchor_unresolved}', which could not "
+                        "be resolved to a calendar date; no quote was selected.",
+                    ),
+                    None,
+                    None,
+                )
+
+            pool = quotes
+            if resolved_date is not None:
+                pool = [q for q in quotes if q.quoted_on == resolved_date]
+                if not pool:
+                    others = sorted({q.quoted_on.isoformat() for q in quotes})
+                    elsewhere = (
+                        f" Quotes exist on other dates ({', '.join(others)}) and were not "
+                        "substituted."
+                        if others
+                        else ""
+                    )
+                    return (
+                        result(
+                            ResolutionStatus.NOT_FOUND,
+                            f"No quote for {names} was given on {resolved_date.isoformat()} "
+                            f"('{anchor_surface or resolved_date.isoformat()}').{elsewhere}",
+                            candidates=[
+                                self._candidate(q, 0.10, ["Different quote date; not eligible"])
+                                for q in quotes
+                            ],
+                        ),
+                        None,
+                        None,
+                    )
+            if not pool:
+                return (
+                    result(ResolutionStatus.NOT_FOUND, f"No quotes found for {names}."),
+                    None,
+                    None,
+                )
+            return self._select(
+                pool=pool,
+                today=today,
+                spoken_amount=spoken_amount,
+                customer=customer,
+                product=product,
+                resolution_id=resolution_id,
+                resolved_at=resolved_at,
+                result=result,
+                context="referenced",
+            )
+
+        # Spoken price only: it is a claim; the authority is an applicable quote.
+        applicable = [q for q in quotes if q.is_applicable_on(today)]
+        if not applicable:
             return (
-                ResolutionResult(
-                    resolution_id=resolution_id,
-                    entity_type="quote",
-                    status=ResolutionStatus.NOT_FOUND,
-                    query=query,
-                    selected_entity_id=None,
-                    candidates=[],
-                    reason=f"No quotes found for customer '{customer.customer.name}' and product '{product.product.name}'.",
+                result(
+                    ResolutionStatus.NOT_FOUND,
+                    f"Spoken price {spoken_amount} cannot be used: no quote for {names} is "
+                    f"valid on {today.isoformat()}. A spoken price is a claim, not "
+                    "business-authoritative pricing.",
+                    entity_type="price",
                 ),
                 None,
                 None,
             )
-
-        # If date resolved (e.g. from 'parso'), filter quotes matching that date
-        matching_quotes = quotes
-        if resolved_date is not None:
-            date_matches = [q for q in quotes if q.quoted_on == resolved_date]
-            if date_matches:
-                matching_quotes = date_matches
-
-        # Check for ambiguity
-        if len(matching_quotes) > 1:
-            candidates = [
-                self._build_candidate(q, score=0.70, evidence=[f"Candidate quote {q.quote_id}"])
-                for q in matching_quotes
-            ]
-            return (
-                ResolutionResult(
-                    resolution_id=resolution_id,
-                    entity_type="quote",
-                    status=ResolutionStatus.AMBIGUOUS,
-                    query=query,
-                    selected_entity_id=None,
-                    candidates=candidates,
-                    reason=f"Multiple quotes ({len(matching_quotes)}) match criteria; cannot resolve price safely.",
-                ),
-                None,
-                None,
-            )
-
-        selected_quote = matching_quotes[0]
-        candidate = self._build_candidate(
-            selected_quote,
-            score=0.99 if selected_quote.status == QuoteStatus.VALID else 0.50,
-            evidence=[
-                f"Quote on {selected_quote.quoted_on.isoformat()}",
-                f"Price {selected_quote.unit_price} {selected_quote.currency}/{selected_quote.unit}",
-                f"Status {selected_quote.status.value}",
-            ],
-        )
-
-        # Safety Check: Expired Quote (Scenario D)
-        if selected_quote.status != QuoteStatus.VALID:
-            return (
-                ResolutionResult(
-                    resolution_id=resolution_id,
-                    entity_type="quote",
-                    status=ResolutionStatus.INVALID,
-                    query=query,
-                    selected_entity_id=selected_quote.quote_id,
-                    candidates=[candidate],
-                    reason=f"Historical quote {selected_quote.quote_id} is {selected_quote.status.value} (valid until {selected_quote.valid_until}). Cannot apply blindly.",
-                ),
-                ResolvedQuote(
-                    quote=selected_quote,
-                    resolution_id=resolution_id,
-                    resolved_at=resolved_at,
-                ),
-                None,
-            )
-
-        # Check spoken claim against quote unit price
-        spoken_price = primary_price.amount if primary_price else None
-        if spoken_price is not None and spoken_price != selected_quote.unit_price:
-            candidate.evidence.append(
-                f"Spoken price claim ({spoken_price}) differs from quote ({selected_quote.unit_price})"
-            )
-
-        resolved_quote = ResolvedQuote(
-            quote=selected_quote,
+        return self._select(
+            pool=applicable,
+            today=today,
+            spoken_amount=spoken_amount,
+            customer=customer,
+            product=product,
             resolution_id=resolution_id,
             resolved_at=resolved_at,
+            result=result,
+            context="current",
         )
 
-        resolved_price = ResolvedPrice(
-            product_id=product.product.product_id,
-            customer_id=customer.customer.customer_id,
-            unit=selected_quote.unit,
-            unit_price=selected_quote.unit_price,
-            currency=selected_quote.currency,
-            source_quote_id=selected_quote.quote_id,
-            resolved_on=resolved_date or selected_quote.quoted_on,
-        )
+    def _select(
+        self,
+        *,
+        pool: list[Quote],
+        today: date,
+        spoken_amount: object,
+        customer: ResolvedCustomer,
+        product: ResolvedProduct,
+        resolution_id: UUID,
+        resolved_at: datetime,
+        result: _ResultFactory,
+        context: str,
+    ) -> _Resolution:
+        applicable = [q for q in pool if q.is_applicable_on(today)]
+
+        if not applicable:
+            # The referenced quote exists but cannot price a transaction today.
+            stale = max(pool, key=lambda q: q.quoted_on)
+            return (
+                result(
+                    ResolutionStatus.INVALID,
+                    f"Historical quote {stale.quote_id} is {stale.status.value} "
+                    f"(quoted {stale.quoted_on.isoformat()}, valid until {stale.valid_until}) "
+                    f"and not applicable on {today.isoformat()}. Cannot apply blindly.",
+                    selected=stale.quote_id,
+                    candidates=[self._candidate(stale, 0.50, ["Not applicable on business date"])],
+                ),
+                ResolvedQuote(quote=stale, resolution_id=resolution_id, resolved_at=resolved_at),
+                None,
+            )
+
+        if len(applicable) > 1:
+            return (
+                result(
+                    ResolutionStatus.AMBIGUOUS,
+                    f"Multiple {context} quotes ({len(applicable)}) match; cannot resolve "
+                    "price safely.",
+                    candidates=[
+                        self._candidate(q, 0.70, [f"Candidate quote {q.quote_id}"])
+                        for q in applicable
+                    ],
+                ),
+                None,
+                None,
+            )
+
+        quote = applicable[0]
+        evidence = [
+            f"Quote on {quote.quoted_on.isoformat()}",
+            f"Valid until {quote.valid_until.isoformat() if quote.valid_until else 'open'}",
+            f"Price {quote.unit_price} {quote.currency}/{quote.unit}",
+            f"Status {quote.status.value}, applicable on {today.isoformat()}",
+        ]
+        if spoken_amount is not None and spoken_amount != quote.unit_price:
+            evidence.append(
+                f"Spoken price claim ({spoken_amount}) differs from quote ({quote.unit_price})"
+            )
+        candidate = self._candidate(quote, 0.99, evidence)
 
         return (
-            ResolutionResult(
-                resolution_id=resolution_id,
-                entity_type="quote",
-                status=ResolutionStatus.RESOLVED,
-                query=query,
-                selected_entity_id=selected_quote.quote_id,
+            result(
+                ResolutionStatus.RESOLVED,
+                f"Resolved {context} quote ({quote.unit_price} {quote.currency}/{quote.unit}) "
+                f"from {quote.quoted_on.isoformat()}, applicable on {today.isoformat()}.",
+                selected=quote.quote_id,
                 candidates=[candidate],
-                reason=f"Resolved valid historical quote ({selected_quote.unit_price} {selected_quote.currency}/{selected_quote.unit}) from {selected_quote.quoted_on}.",
             ),
-            resolved_quote,
-            resolved_price,
+            ResolvedQuote(quote=quote, resolution_id=resolution_id, resolved_at=resolved_at),
+            ResolvedPrice(
+                product_id=product.product.product_id,
+                customer_id=customer.customer.customer_id,
+                unit=quote.unit,
+                unit_price=quote.unit_price,
+                currency=quote.currency,
+                source_quote_id=quote.quote_id,
+                resolved_on=today,
+            ),
         )
 
-    def _build_candidate(
-        self,
-        quote: Quote,
-        score: float,
-        evidence: list[str],
-    ) -> ResolutionCandidate:
+    def _candidate(self, quote: Quote, score: float, evidence: list[str]) -> ResolutionCandidate:
         return ResolutionCandidate(
             candidate_id=uuid4(),
             entity_id=quote.quote_id,
             display_name=f"Quote {quote.quote_id} ({quote.unit_price} {quote.currency})",
-            confidence=Confidence(
-                score=score,
-                source=ConfidenceSource.RULE,
-            ),
+            confidence=Confidence(score=score, source=ConfidenceSource.RULE),
             evidence=evidence,
             attributes={
                 "quote_id": str(quote.quote_id),
                 "unit_price": str(quote.unit_price),
                 "currency": quote.currency,
                 "quoted_on": quote.quoted_on.isoformat(),
+                "valid_until": quote.valid_until.isoformat() if quote.valid_until else None,
                 "status": quote.status.value,
             },
         )

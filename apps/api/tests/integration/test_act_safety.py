@@ -8,7 +8,7 @@ and plan of that run. Every test inspects the repositories directly.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from decimal import Decimal
 from uuid import uuid4
 
@@ -27,9 +27,14 @@ from vaaniflow.domain.schemas.common import Actionability
 from vaaniflow.domain.schemas.semantic import RequestedActionType
 from vaaniflow.domain.schemas.transcript import Transcript
 from vaaniflow.execution.plan import build_plan
-from vaaniflow.infrastructure.repositories.synthetic_data import SyntheticRepositories
+from vaaniflow.infrastructure.repositories.synthetic_data import (
+    SYNTHETIC_BUSINESS_TIME,
+    SyntheticRepositories,
+)
 
-NOW = datetime(2026, 11, 9, 6, 30, tzinfo=UTC)
+# The synthetic dataset's business clock (2026-10-17 12:00 IST): "parso" is
+# 2026-10-15, the date of the canonical Sharma Builders quote.
+NOW = SYNTHETIC_BUSINESS_TIME
 
 CANONICAL = (
     "Arre Suresh, Sharma Builders ko turant 200 bag Ultratech cement dispatch karo. "
@@ -248,13 +253,14 @@ def test_check_price_is_read_only() -> None:
     repos, orchestrator = _setup()
 
     result = orchestrator.process_text(
-        text="Sharma Builders ko 20 bags UltraTech cement ₹400 per bag ka rate kya hai?", now=NOW
+        text="Sharma Builders ko 20 bags UltraTech cement ₹420 per bag ka rate kya hai?", now=NOW
     )
 
     assert result.run.status is VoiceRunStatus.COMPLETED
     assert result.plan is not None and result.plan.tool_names == []
     assert result.plan.read_actions == [RequestedActionType.CHECK_PRICE]
-    assert "Price: 400 INR/bag" in result.message
+    # Answered from the quote record, not echoed from the spoken claim.
+    assert "Price: 420.00 INR/bag" in result.message
     assert result.approval is None
     assert _writes(repos) == (0, 0, 0)
 
@@ -263,7 +269,7 @@ def test_check_inventory_is_read_only() -> None:
     repos, orchestrator = _setup()
 
     result = orchestrator.process_text(
-        text="Sharma Builders ko 20 bags UltraTech cement ₹400 per bag ka stock kitna hai?",
+        text="Sharma Builders ko 20 bags UltraTech cement ₹420 per bag ka stock kitna hai?",
         now=NOW,
     )
 
@@ -306,7 +312,7 @@ def test_unsupported_requested_action_is_not_silently_dropped() -> None:
     repos, orchestrator = _setup()
 
     result = orchestrator.process_text(
-        text="Sharma Builders ko 20 bags UltraTech cement ₹400 per bag WhatsApp pe message karo.",
+        text="Sharma Builders ko 20 bags UltraTech cement ₹420 per bag WhatsApp pe message karo.",
         now=NOW,
     )
 

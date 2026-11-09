@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -24,7 +24,7 @@ from vaaniflow.context.models.resolution import (
 from vaaniflow.context.resolvers.customer import CustomerResolver
 from vaaniflow.context.resolvers.inventory import InventoryResolver
 from vaaniflow.context.resolvers.product import ProductResolver
-from vaaniflow.context.resolvers.quote import PriceQuoteResolver
+from vaaniflow.context.resolvers.quote import HISTORICAL_REFERENCE_TYPES, PriceQuoteResolver
 from vaaniflow.context.resolvers.temporal import TemporalResolver
 from vaaniflow.domain.models.tax import TaxCalculation
 from vaaniflow.domain.schemas.common import DomainSchema
@@ -97,8 +97,20 @@ class ContextResolutionService:
         semantic_state: SemanticState,
         run_id: UUID,
         run_timestamp: datetime | None = None,
+        utterance_timestamp: datetime | None = None,
     ) -> ContextResolutionOutput:
+        """
+        Args:
+            run_timestamp: when the transaction would execute. Quote validity
+                and the business date are evaluated at this time.
+            utterance_timestamp: when the user spoke. Relative dates ("parso")
+                are resolved against it, so re-assessing an approved request
+                later does not shift what "parso" meant. Defaults to
+                run_timestamp.
+        """
         resolved_at = run_timestamp or datetime.now(UTC)
+        spoken_at = utterance_timestamp or resolved_at
+        business_date = self._temporal_resolver.business_date(resolved_at)
         context_id = uuid4()
 
         resolution_results: list[ResolutionResult] = []
@@ -131,16 +143,35 @@ class ContextResolutionService:
             else:
                 resolution_errors.append(f"Product not found: {prod_res.reason}")
 
-        # 3. Resolve Temporal Expressions (e.g., 'parso')
-        resolved_date = None
+        # 3. Resolve Temporal Expressions (e.g., 'parso') against the utterance time
+        expression_dates: dict[UUID, date | None] = {}
         for temp_expr in semantic_state.temporal_expressions:
             temp_res, temp_date = self._temporal_resolver.resolve(
                 expression=temp_expr,
-                run_timestamp=resolved_at,
+                run_timestamp=spoken_at,
             )
             resolution_results.append(temp_res)
-            if temp_date is not None:
-                resolved_date = temp_date
+            expression_dates[temp_expr.expression_id] = temp_date
+
+        # Only the temporal expression the semantic layer linked to the price
+        # reference constrains quote selection; an execution date ("dispatch
+        # kal") never does.
+        anchor_date: date | None = None
+        anchor_surface: str | None = None
+        anchor_unresolved: str | None = None
+        expressions = {e.expression_id: e for e in semantic_state.temporal_expressions}
+        for ref in semantic_state.references:
+            if (
+                ref.reference_type not in HISTORICAL_REFERENCE_TYPES
+                or ref.temporal_expression_id is None
+            ):
+                continue
+            linked = expressions.get(ref.temporal_expression_id)
+            anchor_surface = linked.surface_text if linked else ref.surface_text
+            anchor_date = expression_dates.get(ref.temporal_expression_id)
+            if anchor_date is None:
+                anchor_unresolved = anchor_surface
+            break
 
         # 4. Resolve Historical Price / Quote
         primary_product = resolved_products[0] if resolved_products else None
@@ -149,8 +180,11 @@ class ContextResolutionService:
             product=primary_product,
             pricing=semantic_state.pricing,
             references=semantic_state.references,
-            resolved_date=resolved_date,
+            resolved_date=anchor_date,
             resolved_at=resolved_at,
+            business_date=business_date,
+            anchor_surface=anchor_surface,
+            anchor_unresolved=anchor_unresolved,
         )
         resolution_results.append(quote_res)
 
@@ -165,11 +199,13 @@ class ContextResolutionService:
             resolution_errors.append(f"Invalid quote: {quote_res.reason}")
             unresolved_references.append("HISTORICAL_PRICE")
         elif quote_res.status == ResolutionStatus.NOT_FOUND and any(
-            r.reference_type in {"HISTORICAL_PRICE", "HISTORICAL_QUOTE"}
-            for r in semantic_state.references
+            r.reference_type in HISTORICAL_REFERENCE_TYPES for r in semantic_state.references
         ):
             resolution_errors.append(f"Quote not found: {quote_res.reason}")
             unresolved_references.append("HISTORICAL_PRICE")
+        elif quote_res.status == ResolutionStatus.NOT_FOUND and quote_res.entity_type == "price":
+            if any(p.amount is not None for p in semantic_state.pricing):
+                resolution_errors.append(f"Price not authoritative: {quote_res.reason}")
 
         # 5. Resolve Inventory
         resolved_inventories: list[ResolvedInventory] = []
@@ -213,6 +249,7 @@ class ContextResolutionService:
             unresolved_references=unresolved_references,
             resolution_errors=resolution_errors,
             resolved_at=resolved_at,
+            business_date=business_date,
         )
 
         return ContextResolutionOutput(

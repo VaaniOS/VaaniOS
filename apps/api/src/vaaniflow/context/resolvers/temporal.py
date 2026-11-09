@@ -23,6 +23,10 @@ class TemporalResolver:
         self._tz = ZoneInfo(timezone_str)
         self._timezone_str = timezone_str
 
+    def business_date(self, timestamp: datetime) -> date:
+        """Calendar date of ``timestamp`` in the business timezone."""
+        return timestamp.astimezone(self._tz).date()
+
     def resolve(
         self,
         *,

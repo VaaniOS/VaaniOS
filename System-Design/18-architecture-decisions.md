@@ -160,3 +160,21 @@ Decision:
 
 Reason:
 "don't dispatch" ≠ dispatch, "UltraTech ya ACC" ≠ one product, "200 ya 300" ≠ 300. The semantic layer must surface these explicitly instead of producing a confident COMPLETE state.
+
+## ADR-019 — Pricing authority: a spoken price is a claim
+
+Decision:
+The execution unit price is the price of exactly one quote for the resolved customer and product that is applicable on the business date: status VALID and `quoted_on ≤ business date ≤ valid_until` (inclusive; no `valid_until` means open-ended). A spoken amount is compared with that quote; a mismatch requires confirmation. A historical reference ("rate wahi jo parso bataya tha") only matches quotes given on the date of the temporal expression linked to it; no other date is substituted. If no applicable quote exists, nothing is executable: a spoken price without a quote goes to human handoff, a referenced rate without a matching quote is clarified.
+
+This is the current business policy, not a permanent one. The catalog has no list prices, so a customer without a quote cannot be sold to by voice until an operator prices the request. A future catalog or operator-pricing source must be added as an explicit authority, never as a fallback.
+
+Reason:
+Business facts come from records (ADR-003). Treating whatever amount was heard ("₹1 per bag", or an ASR error) as authoritative would let speech set prices.
+
+## ADR-020 — Explicit business clock
+
+Decision:
+Relative dates resolve against the time the user spoke, and quote validity against the business date of execution, both from the orchestrator's injectable clock. Production uses the real clock. A fixed clock is only ever explicit: the evaluation runner runs scenarios at `SYNTHETIC_BUSINESS_TIME` (the synthetic dataset's 2026-10-17 12:00 IST), and the API uses a fixed clock only when `VAANIFLOW_BUSINESS_CLOCK` is set (`synthetic` or a timezone-aware ISO-8601 instant). Approval re-assessment keeps the original utterance time, so "parso" does not move when approval happens on a later day.
+
+Reason:
+Quote validity and "parso" are only meaningful relative to a business date. Demos and evaluation must be deterministic without hard-coding dates into temporal resolution or weakening production behaviour.
