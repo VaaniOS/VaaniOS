@@ -9,11 +9,18 @@ from vaaniflow.domain.models.quote import Quote, QuoteStatus
 from vaaniflow.domain.models.tax import TaxRule
 from vaaniflow.domain.models.warehouse import Warehouse
 from vaaniflow.infrastructure.repositories.memory import (
+    InMemoryApprovalRepository,
     InMemoryCustomerRepository,
+    InMemoryDispatchRepository,
+    InMemoryHandoffRepository,
     InMemoryInventoryRepository,
+    InMemoryInvoiceRepository,
+    InMemoryOrderRepository,
     InMemoryProductRepository,
     InMemoryQuoteRepository,
     InMemoryTaxRuleRepository,
+    InMemoryToolExecutionRepository,
+    InMemoryVerificationRepository,
     InMemoryWarehouseRepository,
 )
 
@@ -298,3 +305,10 @@ class SyntheticRepositories:
         self.quotes = InMemoryQuoteRepository(get_synthetic_quotes())
         self.inventory = InMemoryInventoryRepository(get_synthetic_inventories())
         self.tax_rules = InMemoryTaxRuleRepository(get_synthetic_tax_rules())
+        self.orders = InMemoryOrderRepository()
+        self.invoices = InMemoryInvoiceRepository()
+        self.dispatches = InMemoryDispatchRepository()
+        self.approvals = InMemoryApprovalRepository()
+        self.handoffs = InMemoryHandoffRepository()
+        self.tool_executions = InMemoryToolExecutionRepository()
+        self.verifications = InMemoryVerificationRepository()

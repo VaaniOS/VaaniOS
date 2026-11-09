@@ -1,9 +1,16 @@
 from vaaniflow.infrastructure.repositories.memory import (
+    InMemoryApprovalRepository,
     InMemoryCustomerRepository,
+    InMemoryDispatchRepository,
+    InMemoryHandoffRepository,
     InMemoryInventoryRepository,
+    InMemoryInvoiceRepository,
+    InMemoryOrderRepository,
     InMemoryProductRepository,
     InMemoryQuoteRepository,
     InMemoryTaxRuleRepository,
+    InMemoryToolExecutionRepository,
+    InMemoryVerificationRepository,
     InMemoryWarehouseRepository,
 )
 from vaaniflow.infrastructure.repositories.synthetic_data import (
@@ -17,11 +24,18 @@ from vaaniflow.infrastructure.repositories.synthetic_data import (
 )
 
 __all__ = [
+    "InMemoryApprovalRepository",
     "InMemoryCustomerRepository",
+    "InMemoryDispatchRepository",
+    "InMemoryHandoffRepository",
     "InMemoryInventoryRepository",
+    "InMemoryInvoiceRepository",
+    "InMemoryOrderRepository",
     "InMemoryProductRepository",
     "InMemoryQuoteRepository",
     "InMemoryTaxRuleRepository",
+    "InMemoryToolExecutionRepository",
+    "InMemoryVerificationRepository",
     "InMemoryWarehouseRepository",
     "SyntheticRepositories",
     "get_synthetic_customers",

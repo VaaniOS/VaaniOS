@@ -4,18 +4,32 @@ from datetime import date
 from uuid import UUID
 
 from vaaniflow.application.ports.business_data import (
+    ApprovalRepository,
     CustomerRepository,
+    DispatchRepository,
+    HandoffRepository,
     InventoryRepository,
+    InvoiceRepository,
+    OrderRepository,
     ProductRepository,
     QuoteRepository,
     TaxRuleRepository,
+    ToolExecutionRepository,
+    VerificationRepository,
     WarehouseRepository,
 )
+from vaaniflow.domain.models.approval import Approval
 from vaaniflow.domain.models.customer import Customer, CustomerStatus
+from vaaniflow.domain.models.dispatch import Dispatch
+from vaaniflow.domain.models.handoff import HandoffCase
 from vaaniflow.domain.models.inventory import Inventory
+from vaaniflow.domain.models.invoice import Invoice
+from vaaniflow.domain.models.order import Order
 from vaaniflow.domain.models.product import Product, ProductStatus
 from vaaniflow.domain.models.quote import Quote, QuoteStatus
 from vaaniflow.domain.models.tax import TaxRule
+from vaaniflow.domain.models.tool_execution import ToolExecution
+from vaaniflow.domain.models.verification import Verification
 from vaaniflow.domain.models.warehouse import Warehouse
 
 
@@ -246,3 +260,152 @@ class InMemoryTaxRuleRepository(TaxRuleRepository):
 
     def list_all(self) -> list[TaxRule]:
         return list(self._rules.values())
+
+
+class InMemoryOrderRepository(OrderRepository):
+    """In-memory implementation of OrderRepository."""
+
+    def __init__(self, orders: list[Order] | None = None) -> None:
+        self._orders: dict[UUID, Order] = {o.order_id: o for o in (orders or [])}
+
+    def save(self, *, order: Order) -> None:
+        self._orders[order.order_id] = order
+
+    def get_by_id(self, *, order_id: UUID) -> Order | None:
+        return self._orders.get(order_id)
+
+    def list_by_customer(self, *, customer_id: UUID) -> list[Order]:
+        return [o for o in self._orders.values() if o.customer_id == customer_id]
+
+    def list_all(self) -> list[Order]:
+        return list(self._orders.values())
+
+
+class InMemoryInvoiceRepository(InvoiceRepository):
+    """In-memory implementation of InvoiceRepository."""
+
+    def __init__(self, invoices: list[Invoice] | None = None) -> None:
+        self._invoices: dict[UUID, Invoice] = {i.invoice_id: i for i in (invoices or [])}
+
+    def save(self, *, invoice: Invoice) -> None:
+        self._invoices[invoice.invoice_id] = invoice
+
+    def get_by_id(self, *, invoice_id: UUID) -> Invoice | None:
+        return self._invoices.get(invoice_id)
+
+    def get_by_order_id(self, *, order_id: UUID) -> Invoice | None:
+        for inv in self._invoices.values():
+            if inv.order_id == order_id:
+                return inv
+        return None
+
+    def list_all(self) -> list[Invoice]:
+        return list(self._invoices.values())
+
+
+class InMemoryDispatchRepository(DispatchRepository):
+    """In-memory implementation of DispatchRepository."""
+
+    def __init__(self, dispatches: list[Dispatch] | None = None) -> None:
+        self._dispatches: dict[UUID, Dispatch] = {d.dispatch_id: d for d in (dispatches or [])}
+
+    def save(self, *, dispatch: Dispatch) -> None:
+        self._dispatches[dispatch.dispatch_id] = dispatch
+
+    def get_by_id(self, *, dispatch_id: UUID) -> Dispatch | None:
+        return self._dispatches.get(dispatch_id)
+
+    def get_by_order_id(self, *, order_id: UUID) -> Dispatch | None:
+        for disp in self._dispatches.values():
+            if disp.order_id == order_id:
+                return disp
+        return None
+
+    def list_all(self) -> list[Dispatch]:
+        return list(self._dispatches.values())
+
+
+class InMemoryApprovalRepository(ApprovalRepository):
+    """In-memory implementation of ApprovalRepository."""
+
+    def __init__(self, approvals: list[Approval] | None = None) -> None:
+        self._approvals: dict[UUID, Approval] = {a.approval_id: a for a in (approvals or [])}
+
+    def save(self, *, approval: Approval) -> None:
+        self._approvals[approval.approval_id] = approval
+
+    def get_by_id(self, *, approval_id: UUID) -> Approval | None:
+        return self._approvals.get(approval_id)
+
+    def get_by_snapshot_version(self, *, snapshot_version: str) -> Approval | None:
+        for app in self._approvals.values():
+            if app.snapshot_version == snapshot_version:
+                return app
+        return None
+
+
+class InMemoryHandoffRepository(HandoffRepository):
+    """In-memory implementation of HandoffRepository."""
+
+    def __init__(self, cases: list[HandoffCase] | None = None) -> None:
+        self._cases: dict[UUID, HandoffCase] = {c.handoff_id: c for c in (cases or [])}
+
+    def save(self, *, handoff_case: HandoffCase) -> None:
+        self._cases[handoff_case.handoff_id] = handoff_case
+
+    def get_by_id(self, *, handoff_id: UUID) -> HandoffCase | None:
+        return self._cases.get(handoff_id)
+
+    def list_by_run(self, *, run_id: UUID) -> list[HandoffCase]:
+        return [c for c in self._cases.values() if c.run_id == run_id]
+
+    def list_all(self) -> list[HandoffCase]:
+        return list(self._cases.values())
+
+
+class InMemoryToolExecutionRepository(ToolExecutionRepository):
+    """In-memory implementation of ToolExecutionRepository."""
+
+    def __init__(self, executions: list[ToolExecution] | None = None) -> None:
+        self._executions: dict[UUID, ToolExecution] = {
+            e.execution_id: e for e in (executions or [])
+        }
+
+    def save(self, *, execution: ToolExecution) -> None:
+        self._executions[execution.execution_id] = execution
+
+    def get_by_id(self, *, execution_id: UUID) -> ToolExecution | None:
+        return self._executions.get(execution_id)
+
+    def get_by_idempotency_key(self, *, idempotency_key: str) -> ToolExecution | None:
+        for ex in self._executions.values():
+            if ex.idempotency_key == idempotency_key:
+                return ex
+        return None
+
+    def list_by_run(self, *, run_id: UUID) -> list[ToolExecution]:
+        return [e for e in self._executions.values() if e.run_id == run_id]
+
+
+class InMemoryVerificationRepository(VerificationRepository):
+    """In-memory implementation of VerificationRepository."""
+
+    def __init__(self, verifications: list[Verification] | None = None) -> None:
+        self._verifications: dict[UUID, Verification] = {
+            v.verification_id: v for v in (verifications or [])
+        }
+
+    def save(self, *, verification: Verification) -> None:
+        self._verifications[verification.verification_id] = verification
+
+    def get_by_id(self, *, verification_id: UUID) -> Verification | None:
+        return self._verifications.get(verification_id)
+
+    def get_by_execution_id(self, *, execution_id: UUID) -> Verification | None:
+        for v in self._verifications.values():
+            if v.execution_id == execution_id:
+                return v
+        return None
+
+    def list_by_run(self, *, run_id: UUID) -> list[Verification]:
+        return [v for v in self._verifications.values() if v.run_id == run_id]
