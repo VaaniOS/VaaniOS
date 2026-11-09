@@ -13,10 +13,9 @@ def test_orchestrator_full_happy_path_with_approval() -> None:
     repos = SyntheticRepositories()
     orchestrator = VoiceWorkflowOrchestrator(repositories=repos)
 
-    # 1. First instruction creates draft & requires approval
+    # 1. The instruction is planned and an approval is requested; nothing executes.
     result1 = orchestrator.process_text(
         text="Send 200 bags of UltraTech cement to Sharma Builders at the rate quoted day before yesterday and dispatch.",
-        is_approved=False,
         now=_NOW,
     )
 
@@ -24,32 +23,30 @@ def test_orchestrator_full_happy_path_with_approval() -> None:
     assert result1.decision is not None
     assert result1.decision.decision == DecisionType.APPROVAL_REQUIRED
     assert result1.approval is not None
-    assert result1.approval.approval_id is not None
+    assert result1.plan is not None
+    assert result1.plan.tool_names == ["create_order", "dispatch_order"]
+    assert repos.orders.list_all() == []
 
-    # 2. Owner approves and re-processes
-    result2 = orchestrator.process_text(
-        text="Send 200 bags of UltraTech cement to Sharma Builders at the rate quoted day before yesterday and dispatch.",
+    # 2. The owner approves that approval; exactly the stored plan executes.
+    result2 = orchestrator.approve(
         run_id=result1.run.run_id,
-        is_approved=True,
+        approval_id=result1.approval.approval_id,
         approved_by=uuid4(),
         now=_NOW,
     )
 
     assert result2.run.status == VoiceRunStatus.COMPLETED
+    assert result2.executed_tools == ["create_order", "dispatch_order"]
     assert result2.execution_outcome is not None
     assert result2.execution_outcome.success is True
     assert result2.execution_outcome.verification is not None
     assert result2.execution_outcome.verification.status.value == "VERIFIED"
 
-    # Verify database state
+    # Verify database state: dispatch was requested, an invoice was not.
     orders = repos.orders.list_all()
     assert len(orders) == 1
     assert orders[0].subtotal == 84000
-
-    invoices = repos.invoices.list_all()
-    assert len(invoices) == 1
-    assert invoices[0].status.value == "ISSUED"
-
+    assert repos.invoices.list_all() == []
     dispatches = repos.dispatches.list_all()
     assert len(dispatches) == 1
     assert dispatches[0].status.value == "DISPATCHED"

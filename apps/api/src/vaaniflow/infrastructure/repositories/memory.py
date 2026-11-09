@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from vaaniflow.application.ports.business_data import (
@@ -35,6 +36,9 @@ from vaaniflow.domain.models.verification import Verification
 from vaaniflow.domain.models.voice_run import VoiceRun
 from vaaniflow.domain.models.warehouse import Warehouse
 from vaaniflow.traces.models import RunTrace, TraceEvent
+
+if TYPE_CHECKING:
+    from vaaniflow.execution.plan import PendingExecution
 
 
 class InMemoryCustomerRepository(CustomerRepository):
@@ -467,3 +471,19 @@ class InMemoryTraceRepository(TraceRepository):
             if trace is not None:
                 traces.append(trace)
         return traces
+
+
+class InMemoryPendingExecutionRepository:
+    """Stores execution plans awaiting approval, keyed by their approval id."""
+
+    def __init__(self) -> None:
+        self._pending: dict[UUID, PendingExecution] = {}
+
+    def save(self, *, pending: PendingExecution) -> None:
+        self._pending[pending.approval_id] = pending
+
+    def get_by_approval_id(self, *, approval_id: UUID) -> PendingExecution | None:
+        return self._pending.get(approval_id)
+
+    def list_by_run(self, *, run_id: UUID) -> list[PendingExecution]:
+        return [p for p in self._pending.values() if p.plan.run_id == run_id]

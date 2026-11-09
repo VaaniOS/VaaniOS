@@ -35,6 +35,23 @@ class PolicyEngine:
         is_approved: bool = False,
         run_id: UUID,
     ) -> Decision:
+        # 0. Rule: An explicitly negated action ("dispatch mat karo") is never
+        #    executable, and a request containing one is not executed as a whole.
+        if semantic_state.negated_actions:
+            negated = ", ".join(a.action_type.value for a in semantic_state.negated_actions)
+            return Decision(
+                decision_id=uuid4(),
+                run_id=run_id,
+                decision=DecisionType.CLARIFY,
+                reason_code=DecisionReasonCode.AMBIGUOUS_INPUT,
+                reason=f"The user explicitly said not to perform: {negated}. Nothing will execute.",
+                allowed=False,
+                requires_user_confirmation=False,
+                requires_approval=False,
+                requires_human_handoff=False,
+                policy_version=self.VERSION,
+            )
+
         # 1. Rule: Identity Ambiguity or Missing Information -> CLARIFY
         identity_failures = [
             c

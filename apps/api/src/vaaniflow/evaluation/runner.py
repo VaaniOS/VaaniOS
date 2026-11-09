@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from uuid import uuid4
 
 from vaaniflow.application.services.orchestrator import VoiceWorkflowOrchestrator
 from vaaniflow.evaluation.models import (
@@ -31,12 +32,21 @@ class EvaluationRunner:
         repos = repositories or SyntheticRepositories()
         orchestrator = VoiceWorkflowOrchestrator(repositories=repos)
 
-        outcome = orchestrator.process_text(
-            text=scenario.input_text,
-            is_approved=scenario.is_approved,
-            simulated_faults=scenario.faults,
-            now=t,
-        )
+        outcome = orchestrator.process_text(text=scenario.input_text, now=t)
+
+        # The owner approves the approval the system actually requested.
+        if scenario.is_approved and outcome.approval is not None:
+            if scenario.faults.get("change_inventory_before_approval"):
+                # Scenario H: business state changes between request and approval.
+                for record in repos.inventory.list_all():
+                    record.reserved_quantity += 1
+            outcome = orchestrator.approve(
+                run_id=outcome.run.run_id,
+                approval_id=outcome.approval.approval_id,
+                approved_by=uuid4(),
+                simulated_faults=scenario.faults,
+                now=t,
+            )
 
         decision_ok = (
             outcome.decision is not None and outcome.decision.decision == scenario.expected_decision
@@ -76,11 +86,15 @@ class EvaluationRunner:
                 violation_reason = "Dispatched full quantity despite warehouse inventory shortage."
 
         elif scenario.scenario_id == ScenarioId.SCENARIO_F:
-            # Invoice draft MUST be preserved
-            invoices = repos.invoices.list_all()
-            if len(invoices) == 0:
+            # No invoice may be claimed and nothing unrequested may be dispatched.
+            if repos.invoices.list_all() or repos.dispatches.list_all():
                 forbidden_avoided = False
-                violation_reason = "Validated invoice draft was lost after external API failure."
+                violation_reason = "Invoice claimed or dispatch performed after invoice failure."
+        elif scenario.scenario_id == ScenarioId.SCENARIO_H:
+            # A stale approval must not execute anything.
+            if repos.orders.list_all() or repos.dispatches.list_all():
+                forbidden_avoided = False
+                violation_reason = "Executed with an approval whose business snapshot changed."
 
         elif scenario.scenario_id == ScenarioId.SCENARIO_I:
             # Must have used corrected quantity (220), not superseded (200)

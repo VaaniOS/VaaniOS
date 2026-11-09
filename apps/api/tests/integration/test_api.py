@@ -39,7 +39,6 @@ def test_process_run_and_trace() -> None:
         f"/runs/{run_id}/process",
         json={
             "text": "Send 200 bags of UltraTech cement to Sharma Builders at the rate quoted day before yesterday and dispatch.",
-            "is_approved": False,
         },
     )
     assert proc_res.status_code == 200
@@ -52,10 +51,13 @@ def test_process_run_and_trace() -> None:
     trace_data = trace_res.json()
     assert len(trace_data["events"]) > 0
 
-    # 4. Approve run
-    approve_res = client.post(f"/runs/{run_id}/approve", json={})
+    # 4. Approve the approval the system requested
+    approve_res = client.post(
+        f"/runs/{run_id}/approve", json={"approval_id": proc_data["approval_id"]}
+    )
     assert approve_res.status_code == 200
     assert approve_res.json()["status"] == "COMPLETED"
+    assert approve_res.json()["executed_tools"] == ["create_order", "dispatch_order"]
 
 
 def test_search_endpoints() -> None:

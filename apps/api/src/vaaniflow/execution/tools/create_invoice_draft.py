@@ -16,6 +16,13 @@ class CreateInvoiceDraftTool(Tool):
     is_idempotent = True
 
     def execute(self, *, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
+        # Failure injection sandbox support (Scenario F)
+        if context.metadata.get("simulate_invoice_failure"):
+            return ToolResult(
+                success=False,
+                error_code="INVOICE_GATEWAY_TIMEOUT",
+                error_message="External billing service unavailable. No invoice was created.",
+            )
         try:
             order_id = UUID(str(arguments["order_id"]))
             customer_id = UUID(str(arguments["customer_id"]))

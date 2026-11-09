@@ -10,11 +10,52 @@ from vaaniflow.api.schemas import (
     CreateRunResponse,
     ManualHandoffRequest,
     ProcessRunRequest,
+    RejectRequest,
     WorkflowResponse,
 )
+from vaaniflow.application.services.orchestrator import ApprovalFlowError, WorkflowResult
 from vaaniflow.domain.models.voice_run import VoiceRunStatus
 
 router = APIRouter(prefix="/runs", tags=["Runs"])
+
+_APPROVAL_ERROR_STATUS = {
+    "RUN_NOT_FOUND": status.HTTP_404_NOT_FOUND,
+    "APPROVAL_NOT_FOUND": status.HTTP_404_NOT_FOUND,
+    "APPROVAL_RUN_MISMATCH": status.HTTP_409_CONFLICT,
+    "APPROVAL_NOT_PENDING": status.HTTP_409_CONFLICT,
+}
+
+
+def _to_response(result: WorkflowResult) -> WorkflowResponse:
+    understand = result.understand_result
+    plan = result.plan
+    return WorkflowResponse(
+        run_id=result.run.run_id,
+        status=result.run.status,
+        message=result.message,
+        decision=result.decision.decision if result.decision else None,
+        decision_reason=result.decision.reason if result.decision else None,
+        snapshot_version=result.snapshot_version,
+        approval_required=result.run.status is VoiceRunStatus.APPROVAL_REQUIRED
+        and result.approval is not None,
+        approval_id=result.approval.approval_id if result.approval else None,
+        handoff_case_id=result.handoff_case.handoff_id if result.handoff_case else None,
+        execution_success=result.execution_outcome.success if result.execution_outcome else None,
+        actionability=understand.actionability.value if understand else None,
+        evaluation_reasons=list(understand.evaluation.reasons) if understand else [],
+        ambiguities=list(understand.semantic_state.ambiguities) if understand else [],
+        planned_tools=plan.tool_names if plan else [],
+        unsupported_actions=[a.value for a in plan.unsupported_actions] if plan else [],
+        excluded_negated_actions=[a.value for a in plan.excluded_negated_actions] if plan else [],
+        executed_tools=result.executed_tools,
+    )
+
+
+def _approval_http_error(error: ApprovalFlowError) -> HTTPException:
+    return HTTPException(
+        status_code=_APPROVAL_ERROR_STATUS.get(error.code, status.HTTP_409_CONFLICT),
+        detail={"code": error.code, "message": error.message},
+    )
 
 
 @router.post("", response_model=CreateRunResponse, status_code=status.HTTP_201_CREATED)
@@ -70,26 +111,8 @@ def process_run(
             detail="Instruction text must be provided for processing.",
         )
 
-    result = container.orchestrator.process_text(
-        text=text,
-        run_id=run_id,
-        is_approved=payload.is_approved,
-        approved_by=payload.approved_by,
-        simulated_faults=payload.faults,
-    )
-
-    return WorkflowResponse(
-        run_id=result.run.run_id,
-        status=result.run.status,
-        message=result.message,
-        decision=result.decision.decision if result.decision else None,
-        decision_reason=result.decision.reason if result.decision else None,
-        snapshot_version=result.snapshot_version,
-        approval_required=bool(result.approval),
-        approval_id=result.approval.approval_id if result.approval else None,
-        handoff_case_id=result.handoff_case.handoff_id if result.handoff_case else None,
-        execution_success=result.execution_outcome.success if result.execution_outcome else None,
-    )
+    result = container.orchestrator.process_text(text=text, run_id=run_id)
+    return _to_response(result)
 
 
 @router.get("/{run_id}/trace")
@@ -150,26 +173,34 @@ def approve_run(
     payload: ApproveRequest,
     container: ContainerDep,
 ) -> WorkflowResponse:
-    run = container.repositories.runs.get_by_id(run_id=run_id)
-    if not run:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found.")
+    """Approve one pending approval of this run and execute exactly its stored plan."""
+    try:
+        result = container.orchestrator.approve(
+            run_id=run_id,
+            approval_id=payload.approval_id,
+            approved_by=payload.approved_by or uuid4(),
+        )
+    except ApprovalFlowError as error:
+        raise _approval_http_error(error) from error
+    return _to_response(result)
 
-    # Re-process with explicit approval granted
-    result = container.orchestrator.process_text(
-        text="Send 200 bags of UltraTech cement to Sharma Builders at the rate quoted day before yesterday and dispatch.",
-        run_id=run_id,
-        is_approved=True,
-        approved_by=payload.approved_by or uuid4(),
-    )
 
-    return WorkflowResponse(
-        run_id=result.run.run_id,
-        status=result.run.status,
-        message=result.message,
-        decision=result.decision.decision if result.decision else None,
-        decision_reason=result.decision.reason if result.decision else None,
-        execution_success=result.execution_outcome.success if result.execution_outcome else None,
-    )
+@router.post("/{run_id}/reject", response_model=WorkflowResponse)
+def reject_run(
+    run_id: UUID,
+    payload: RejectRequest,
+    container: ContainerDep,
+) -> WorkflowResponse:
+    """Reject one pending approval of this run; its plan can never execute."""
+    try:
+        result = container.orchestrator.reject(
+            run_id=run_id,
+            approval_id=payload.approval_id,
+            rejected_by=payload.rejected_by or uuid4(),
+        )
+    except ApprovalFlowError as error:
+        raise _approval_http_error(error) from error
+    return _to_response(result)
 
 
 @router.post("/{run_id}/clarify", response_model=WorkflowResponse)

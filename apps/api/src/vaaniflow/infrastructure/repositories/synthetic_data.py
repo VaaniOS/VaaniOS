@@ -16,6 +16,7 @@ from vaaniflow.infrastructure.repositories.memory import (
     InMemoryInventoryRepository,
     InMemoryInvoiceRepository,
     InMemoryOrderRepository,
+    InMemoryPendingExecutionRepository,
     InMemoryProductRepository,
     InMemoryQuoteRepository,
     InMemoryTaxRuleRepository,
@@ -316,3 +317,4 @@ class SyntheticRepositories:
         self.verifications = InMemoryVerificationRepository()
         self.runs = InMemoryVoiceRunRepository()
         self.traces = InMemoryTraceRepository()
+        self.pending_executions = InMemoryPendingExecutionRepository()
