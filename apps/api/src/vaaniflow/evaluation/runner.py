@@ -1,7 +1,7 @@
 from datetime import datetime
-from uuid import uuid4
 
 from vaaniflow.application.services.orchestrator import VoiceWorkflowOrchestrator
+from vaaniflow.domain.models.principal import SYNTHETIC_EVALUATION_OWNER
 from vaaniflow.evaluation.models import (
     ScenarioDefinition,
     ScenarioEvaluationResult,
@@ -48,7 +48,8 @@ class EvaluationRunner:
             outcome = orchestrator.approve(
                 run_id=outcome.run.run_id,
                 approval_id=outcome.approval.approval_id,
-                approved_by=uuid4(),
+                # The labelled synthetic actor; never an HTTP caller's identity.
+                actor=SYNTHETIC_EVALUATION_OWNER,
                 simulated_faults=scenario.faults,
                 now=t,
             )

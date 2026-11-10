@@ -17,6 +17,7 @@ from uuid import UUID, uuid4
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.auth_support import OWNER, STAFF, auth, provider
 from vaaniflow.api.app import app
 from vaaniflow.api.dependencies import AppContainer, reset_container
 from vaaniflow.application.services.orchestrator import (
@@ -104,9 +105,9 @@ def _approve(
 ) -> WorkflowResult:
     assert result.approval is not None
     return orchestrator.approve(
+        actor=STAFF,
         run_id=result.run.run_id,
         approval_id=result.approval.approval_id,
-        approved_by=approved_by,
         simulated_faults=faults,
     )
 
@@ -349,14 +350,14 @@ def test_duplicate_detection_does_not_disturb_normal_execution() -> None:
 
 
 def _fresh_api() -> AppContainer:
-    return reset_container(clock=lambda: T)
+    return reset_container(clock=lambda: T, identity_provider=provider())
 
 
 def test_approval_records_run_plan_snapshot_and_actors() -> None:
     container = _fresh_api()
     repos = container.repositories
-    run_id = client.post("/runs").json()["run_id"]
-    body = client.post(f"/runs/{run_id}/process", json={"text": KUMAR}).json()
+    run_id = client.post("/runs", headers=auth()).json()["run_id"]
+    body = client.post(f"/runs/{run_id}/process", json={"text": KUMAR}, headers=auth()).json()
     approval_id = UUID(body["approval_id"])
     pending = repos.pending_executions.get_by_approval_id(approval_id=approval_id)
     approval = repos.approvals.get_by_id(approval_id=approval_id)
@@ -366,20 +367,20 @@ def test_approval_records_run_plan_snapshot_and_actors() -> None:
     assert approval.plan_id == pending.plan.plan_id
     assert approval.plan_fingerprint == pending.plan.fingerprint
     assert approval.snapshot_version == pending.plan.snapshot_version
-    assert approval.requested_by is None  # no identity is invented
-    assert approval.actor_authenticated is False
+    # The requester is the authenticated run owner; nobody has approved yet.
+    assert approval.requested_by == STAFF.principal_id
+    assert approval.actor_authenticated is False and approval.approved_by is None
     assert approval.requested_at == T
 
-    operator = uuid4()
     approved = client.post(
-        f"/runs/{run_id}/approve",
-        json={"approval_id": str(approval_id), "approved_by": str(operator)},
+        f"/runs/{run_id}/approve", json={"approval_id": str(approval_id)}, headers=auth(OWNER)
     )
     assert approved.status_code == 200
     final = repos.approvals.get_by_id(approval_id=approval_id)
     assert final is not None
     assert final.status is ApprovalStatus.APPROVED
-    assert final.approved_by == operator and final.actor_authenticated is False
+    assert final.approved_by == OWNER.principal_id and final.approved_actor == OWNER
+    assert final.actor_authenticated is True
     assert final.resolved_at == T
     assert final.approved_snapshot_version == final.snapshot_version
     order = repos.orders.list_all()[0]
@@ -387,22 +388,27 @@ def test_approval_records_run_plan_snapshot_and_actors() -> None:
     assert final.order_id == order.order_id and final.dispatch_id == dispatch.dispatch_id
 
 
-def test_approval_without_identity_records_none_not_a_fabricated_id() -> None:
+def test_approval_records_the_authenticated_approver_never_a_fabricated_id() -> None:
     container = _fresh_api()
-    run_id = client.post("/runs").json()["run_id"]
-    body = client.post(f"/runs/{run_id}/process", json={"text": KUMAR}).json()
+    run_id = client.post("/runs", headers=auth()).json()["run_id"]
+    body = client.post(f"/runs/{run_id}/process", json={"text": KUMAR}, headers=auth()).json()
 
-    client.post(f"/runs/{run_id}/approve", json={"approval_id": body["approval_id"]})
+    client.post(
+        f"/runs/{run_id}/approve", json={"approval_id": body["approval_id"]}, headers=auth(OWNER)
+    )
 
     approval = container.repositories.approvals.get_by_id(approval_id=UUID(body["approval_id"]))
     assert approval is not None
-    assert approval.status is ApprovalStatus.APPROVED and approval.approved_by is None
+    assert approval.status is ApprovalStatus.APPROVED
+    assert approval.approved_by == OWNER.principal_id
+    assert approval.approved_actor is not None
+    assert approval.approved_actor.authentication_method == "bearer-token"
 
 
 def test_superseded_rejected_and_expired_approvals_keep_their_history() -> None:
     container = _fresh_api()
     repos = container.repositories
-    user_headers = {"Authorization": f"Bearer {uuid4()}"}
+    user_headers = auth()
     run_id = client.post("/runs", headers=user_headers).json()["run_id"]
     first = client.post(
         f"/runs/{run_id}/process", json={"text": KUMAR}, headers=user_headers
@@ -417,28 +423,31 @@ def test_superseded_rejected_and_expired_approvals_keep_their_history() -> None:
     assert superseded.superseded_by == UUID(second["approval_id"])
     assert superseded.resolved_at == T and superseded.run_id == UUID(run_id)
 
-    rejector = uuid4()
     rejected = client.post(
         f"/runs/{run_id}/reject",
-        json={
-            "approval_id": second["approval_id"],
-            "rejected_by": str(rejector),
-            "reason": "Wrong site",
-        },
+        json={"approval_id": second["approval_id"], "reason": "Wrong site"},
+        headers=auth(OWNER),
     )
     assert rejected.status_code == 200
     record = repos.approvals.get_by_id(approval_id=UUID(second["approval_id"]))
     assert record is not None
     assert record.status is ApprovalStatus.REJECTED
-    assert record.rejected_by == rejector and record.approved_by is None
+    assert record.rejected_by == OWNER.principal_id and record.rejected_actor == OWNER
+    assert record.approved_by is None
     assert record.rejection_reason == "Wrong site" and record.resolved_at == T
 
+    # A rejected run is closed: a new instruction goes to a new run (ADR-022).
+    reopen = client.post(f"/runs/{run_id}/process", json={"text": KUMAR}, headers=user_headers)
+    assert reopen.status_code == 409 and reopen.json()["detail"]["code"] == "RUN_CLOSED"
+    run_id = client.post("/runs", headers=user_headers).json()["run_id"]
     third = client.post(
         f"/runs/{run_id}/process", json={"text": KUMAR}, headers=user_headers
     ).json()
     for inventory in repos.inventory.list_all():
         inventory.reserved_quantity += 1  # business state changes before approval
-    client.post(f"/runs/{run_id}/approve", json={"approval_id": third["approval_id"]})
+    client.post(
+        f"/runs/{run_id}/approve", json={"approval_id": third["approval_id"]}, headers=auth()
+    )
     expired = repos.approvals.get_by_id(approval_id=UUID(third["approval_id"]))
     assert expired is not None
     assert expired.status is ApprovalStatus.EXPIRED
@@ -449,7 +458,7 @@ def test_superseded_rejected_and_expired_approvals_keep_their_history() -> None:
 
 def test_audit_identity_never_grants_authorization() -> None:
     container = _fresh_api()
-    user_headers = {"Authorization": f"Bearer {uuid4()}"}
+    user_headers = auth()
     run_id = client.post("/runs", headers=user_headers).json()["run_id"]
     first = client.post(
         f"/runs/{run_id}/process", json={"text": KUMAR}, headers=user_headers
@@ -459,15 +468,23 @@ def test_audit_identity_never_grants_authorization() -> None:
     claimed_owner = client.post(
         f"/runs/{run_id}/approve",
         json={"approval_id": first["approval_id"], "approved_by": str(uuid4())},
+        headers=auth(),
     )
     forged = client.post(
         f"/runs/{run_id}/approve",
         json={"approval_id": first["approval_id"], "actor_authenticated": True},
+        headers=auth(),
     )
 
-    assert claimed_owner.status_code == 409  # superseded stays superseded
-    assert claimed_owner.json()["detail"]["code"] == "APPROVAL_SUPERSEDED"
+    # Identity fields in the body are refused outright (ADR-022) ...
+    assert claimed_owner.status_code == 422
     assert forged.status_code == 422
+    # ... and the superseded approval stays superseded for an authenticated owner.
+    superseded = client.post(
+        f"/runs/{run_id}/approve", json={"approval_id": first["approval_id"]}, headers=auth(OWNER)
+    )
+    assert superseded.status_code == 409
+    assert superseded.json()["detail"]["code"] == "APPROVAL_SUPERSEDED"
     assert _writes(container.repositories) == (0, 0, 0)
 
 
@@ -485,6 +502,7 @@ def test_confirmation_is_bound_and_still_requires_approval() -> None:
     assert asked.confirmation.warning_keys == ["PRICE_CONSISTENCY|pricing.amount|400.00|1"]
 
     confirmed = orchestrator.confirm(
+        actor=STAFF,
         run_id=asked.run.run_id,
         reply="Yes, confirm.",
         confirmation_id=asked.confirmation.confirmation_id,
@@ -510,7 +528,7 @@ def test_confirmation_without_id_binds_to_the_runs_single_pending_confirmation()
     repos, orchestrator = _setup()
     asked = orchestrator.process_text(text=KUMAR_RUPEE)
 
-    confirmed = orchestrator.confirm(run_id=asked.run.run_id, reply="haan theek hai")
+    confirmed = orchestrator.confirm(actor=STAFF, run_id=asked.run.run_id, reply="haan theek hai")
 
     assert confirmed.approval is not None
     assert _writes(repos) == (0, 0, 0)
@@ -525,6 +543,7 @@ def test_confirmation_after_supersession_is_refused() -> None:
 
     with pytest.raises(ConfirmationFlowError) as excinfo:
         orchestrator.confirm(
+            actor=STAFF,
             run_id=asked.run.run_id,
             reply="yes",
             confirmation_id=asked.confirmation.confirmation_id,
@@ -542,7 +561,7 @@ def test_confirmation_with_nothing_pending_changes_nothing() -> None:
     repos, orchestrator = _setup()
     executed = _approve(orchestrator, orchestrator.process_text(text=KUMAR))
 
-    reply = orchestrator.confirm(run_id=executed.run.run_id, reply="yes")
+    reply = orchestrator.confirm(actor=STAFF, run_id=executed.run.run_id, reply="yes")
 
     assert reply.decision is not None and reply.decision.decision is DecisionType.CLARIFY
     assert reply.run.status is VoiceRunStatus.COMPLETED  # unchanged
@@ -555,12 +574,13 @@ def test_declined_confirmation_cannot_be_confirmed_later() -> None:
     asked = orchestrator.process_text(text=KUMAR_RUPEE)
     assert asked.confirmation is not None
 
-    declined = orchestrator.confirm(run_id=asked.run.run_id, reply="nahi")
+    declined = orchestrator.confirm(actor=STAFF, run_id=asked.run.run_id, reply="nahi")
     assert declined.run.status is VoiceRunStatus.BLOCKED
     assert declined.run.failure_code == "CONFIRMATION_DECLINED"
 
     with pytest.raises(ConfirmationFlowError) as excinfo:
         orchestrator.confirm(
+            actor=STAFF,
             run_id=asked.run.run_id,
             reply="yes",
             confirmation_id=asked.confirmation.confirmation_id,
@@ -578,6 +598,7 @@ def test_confirmation_for_another_run_is_refused() -> None:
 
     with pytest.raises(ConfirmationFlowError) as excinfo:
         orchestrator.confirm(
+            actor=STAFF,
             run_id=run_b.run.run_id,
             reply="yes",
             confirmation_id=run_a.confirmation.confirmation_id,
@@ -599,7 +620,7 @@ def test_confirmation_after_business_state_changed_expires() -> None:
     assert quote is not None
     quote.unit_price = Decimal("410.00")  # the quote changed after the user was asked
 
-    result = orchestrator.confirm(run_id=asked.run.run_id, reply="yes")
+    result = orchestrator.confirm(actor=STAFF, run_id=asked.run.run_id, reply="yes")
 
     old = repos.pending_confirmations.get_by_id(confirmation_id=asked.confirmation.confirmation_id)
     assert old is not None and old.status is ConfirmationStatus.EXPIRED
@@ -614,7 +635,7 @@ def test_unclear_reply_keeps_the_confirmation_pending() -> None:
     asked = orchestrator.process_text(text=KUMAR_RUPEE)
     assert asked.confirmation is not None
 
-    result = orchestrator.confirm(run_id=asked.run.run_id, reply="haan, mat karo")
+    result = orchestrator.confirm(actor=STAFF, run_id=asked.run.run_id, reply="haan, mat karo")
 
     record = repos.pending_confirmations.get_by_id(
         confirmation_id=asked.confirmation.confirmation_id
@@ -625,18 +646,26 @@ def test_unclear_reply_keeps_the_confirmation_pending() -> None:
 
 def test_confirm_endpoint_answers_only_the_bound_confirmation() -> None:
     container = _fresh_api()
-    run_id = client.post("/runs").json()["run_id"]
-    asked = client.post(f"/runs/{run_id}/process", json={"text": KUMAR_RUPEE}).json()
+    run_id = client.post("/runs", headers=auth()).json()["run_id"]
+    asked = client.post(
+        f"/runs/{run_id}/process", json={"text": KUMAR_RUPEE}, headers=auth()
+    ).json()
     assert asked["status"] == "CONFIRMATION_REQUIRED"
     assert asked["approval_id"] is None and asked["approval_required"] is False
     confirmation_id = asked["confirmation"]["confirmation_id"]
 
-    bypass = client.post(f"/runs/{run_id}/confirm", json={"reply": "yes", "is_approved": True})
+    bypass = client.post(
+        f"/runs/{run_id}/confirm", json={"reply": "yes", "is_approved": True}, headers=auth()
+    )
     unknown = client.post(
-        f"/runs/{run_id}/confirm", json={"reply": "yes", "confirmation_id": str(uuid4())}
+        f"/runs/{run_id}/confirm",
+        json={"reply": "yes", "confirmation_id": str(uuid4())},
+        headers=auth(),
     )
     ok = client.post(
-        f"/runs/{run_id}/confirm", json={"reply": "yes", "confirmation_id": confirmation_id}
+        f"/runs/{run_id}/confirm",
+        json={"reply": "yes", "confirmation_id": confirmation_id},
+        headers=auth(),
     )
 
     assert bypass.status_code == 422
@@ -682,16 +711,16 @@ def _late_commit(container: AppContainer, execution: Any) -> UUID:
 
 def _resolve(run_id: str, execution_id: Any, **body: Any) -> Any:
     payload = {"attempt": 1, "outcome": "SUCCEEDED", "reason": "Checked the ERP", **body}
-    return client.post(f"/runs/{run_id}/executions/{execution_id}/resolve", json=payload)
+    return client.post(
+        f"/runs/{run_id}/executions/{execution_id}/resolve", json=payload, headers=auth()
+    )
 
 
 def test_operator_resolves_unknown_to_success_only_with_a_verified_record() -> None:
     container = _fresh_api()
     run_id, execution = _unknown_order(container)
     order_id = _late_commit(container, execution)
-    operator = uuid4()
-
-    response = _resolve(run_id, execution.execution_id, resolved_by=str(operator))
+    response = _resolve(run_id, execution.execution_id)
 
     assert response.status_code == 200
     body = response.json()
@@ -699,7 +728,8 @@ def test_operator_resolves_unknown_to_success_only_with_a_verified_record() -> N
     assert record is not None
     assert record.status is ToolExecutionStatus.SUCCEEDED
     assert record.resolution == "OPERATOR_CONFIRMED_SUCCESS"
-    assert record.resolved_by == operator and record.resolved_at == T
+    assert record.resolved_by == STAFF.principal_id and record.resolved_actor == STAFF
+    assert record.resolved_at == T
     assert record.resolution_reason == "Checked the ERP"
     assert record.prior_status is ToolExecutionStatus.UNKNOWN  # history kept
     assert record.prior_error_code == "TOOL_TIMEOUT" and record.prior_error_message
@@ -808,15 +838,13 @@ def test_a_verified_execution_cannot_be_resolved() -> None:
 
 def test_completed_canonical_run_is_auditable_end_to_end() -> None:
     _fresh_api()
-    run_id = client.post("/runs").json()["run_id"]
-    body = client.post(f"/runs/{run_id}/process", json={"text": CANONICAL}).json()
-    operator = uuid4()
+    run_id = client.post("/runs", headers=auth()).json()["run_id"]
+    body = client.post(f"/runs/{run_id}/process", json={"text": CANONICAL}, headers=auth()).json()
     client.post(
-        f"/runs/{run_id}/approve",
-        json={"approval_id": body["approval_id"], "approved_by": str(operator)},
+        f"/runs/{run_id}/approve", json={"approval_id": body["approval_id"]}, headers=auth(OWNER)
     )
 
-    audit = client.get(f"/runs/{run_id}/audit").json()
+    audit = client.get(f"/runs/{run_id}/audit", headers=auth()).json()
 
     # What did the user request, and what was understood?
     assert audit["instructions"][0]["text"] == CANONICAL
@@ -827,7 +855,8 @@ def test_completed_canonical_run_is_auditable_end_to_end() -> None:
     plan = audit["plans"][0]
     assert plan["approval"]["approval_id"] == body["approval_id"]
     assert plan["approval"]["status"] == "APPROVED"
-    assert plan["approval"]["approved_by"] == str(operator)
+    assert plan["approval"]["approved_by"] == str(OWNER.principal_id)
+    assert plan["approval"]["approved_actor"]["display_name"] == OWNER.display_name
     assert plan["approval"]["plan_fingerprint"] == plan["fingerprint"]
     assert plan["approval_required_because"]
     quotes = plan["resolved_context"]["quotes"]
@@ -1208,7 +1237,7 @@ def test_conflicting_links_without_a_price_pointer_are_not_guessed() -> None:
 def test_clarification_preserves_what_was_understood_and_what_is_missing() -> None:
     container = _fresh_api()
     repos = container.repositories
-    user_headers = {"Authorization": f"Bearer {uuid4()}"}
+    user_headers = auth()
     run_id = client.post("/runs", headers=user_headers).json()["run_id"]
 
     body = client.post(
@@ -1295,11 +1324,12 @@ def test_resolution_guidance_matches_what_the_system_will_actually_do() -> None:
     assert run is not None and run.failure_code == "REMAINING_STEPS_NOT_ATTEMPTED"
     assert _writes(container.repositories) == (1, 0, 0)  # dispatch not run
 
-    # Following the old advice is refused exactly as the new guidance says.
-    user_headers = {"Authorization": f"Bearer {uuid4()}"}
-    retry = client.post(
-        f"/runs/{run_id}/process", json={"text": KUMAR}, headers=user_headers
-    ).json()
+    # The handed-off run takes no new instruction (ADR-022) ...
+    reopen = client.post(f"/runs/{run_id}/process", json={"text": KUMAR}, headers=auth())
+    assert reopen.status_code == 409 and reopen.json()["detail"]["code"] == "RUN_ESCALATED"
+    # ... and following the old advice on a new run is refused as a duplicate.
+    new_run = client.post("/runs", headers=auth()).json()["run_id"]
+    retry = client.post(f"/runs/{new_run}/process", json={"text": KUMAR}, headers=auth()).json()
     assert retry["status"] == "BLOCKED"
     assert retry["duplicate_check"]["status"] == "DUPLICATE_FOUND"
     assert _writes(container.repositories) == (1, 0, 0)
@@ -1316,7 +1346,7 @@ def test_late_commit_after_failed_resolution_is_reported_as_a_contradiction() ->
     assert _resolve(run_id, execution.execution_id, outcome="FAILED").status_code == 200
     order_id = _late_commit(container, execution)  # the business system commits late
 
-    audit = client.get(f"/runs/{run_id}/audit").json()
+    audit = client.get(f"/runs/{run_id}/audit", headers=auth()).json()
 
     reconciliation = audit["reconciliation"]
     assert reconciliation["consistent"] is False
@@ -1327,7 +1357,7 @@ def test_late_commit_after_failed_resolution_is_reported_as_a_contradiction() ->
             "tool_name": "create_order",
             "recorded_status": "FAILED",
             "resolution": "OPERATOR_CONFIRMED_FAILURE",
-            "resolved_by": None,
+            "resolved_by": str(STAFF.principal_id),
             "committed_record_id": str(order_id),
             "message": reconciliation["contradictions"][0]["message"],
         }
@@ -1338,15 +1368,19 @@ def test_late_commit_after_failed_resolution_is_reported_as_a_contradiction() ->
     assert record.resolution == "OPERATOR_CONFIRMED_FAILURE"
     assert record.prior_status is ToolExecutionStatus.UNKNOWN
 
-    retry = client.post("/runs", json={}).json()["run_id"]
-    blocked = client.post(f"/runs/{retry}/process", json={"text": KUMAR}).json()
+    retry = client.post("/runs", json={}, headers=auth()).json()["run_id"]
+    blocked = client.post(f"/runs/{retry}/process", json={"text": KUMAR}, headers=auth()).json()
     assert blocked["duplicate_check"]["status"] == "DUPLICATE_FOUND"
     assert _writes(container.repositories) == (1, 0, 0)  # no second order, no retry
 
-    clean_run = client.post("/runs").json()["run_id"]
-    body = client.post(f"/runs/{clean_run}/process", json={"text": SHARMA_UT}).json()
-    client.post(f"/runs/{clean_run}/approve", json={"approval_id": body["approval_id"]})
-    clean = client.get(f"/runs/{clean_run}/audit").json()["reconciliation"]
+    clean_run = client.post("/runs", headers=auth()).json()["run_id"]
+    body = client.post(
+        f"/runs/{clean_run}/process", json={"text": SHARMA_UT}, headers=auth()
+    ).json()
+    client.post(
+        f"/runs/{clean_run}/approve", json={"approval_id": body["approval_id"]}, headers=auth()
+    )
+    clean = client.get(f"/runs/{clean_run}/audit", headers=auth()).json()["reconciliation"]
     assert clean == {"consistent": True, "contradictions": []}
 
 
@@ -1361,7 +1395,7 @@ def test_confirmation_accepts_only_its_own_warning_keys_on_an_unchanged_snapshot
     )
     repos.pending_confirmations.save(confirmation=foreign)  # snapshot left unchanged
 
-    result = orchestrator.confirm(run_id=asked.run.run_id, reply="yes")
+    result = orchestrator.confirm(actor=STAFF, run_id=asked.run.run_id, reply="yes")
 
     assert result.approval is None  # the foreign "yes" does not cover the real warning
     assert result.run.status is VoiceRunStatus.CONFIRMATION_REQUIRED

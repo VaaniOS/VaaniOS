@@ -6,7 +6,7 @@ import os
 import subprocess
 from dataclasses import dataclass
 from typing import Any
-from uuid import NAMESPACE_DNS, UUID, uuid5
+from uuid import UUID
 
 import httpx
 
@@ -15,12 +15,30 @@ from vaaniflow.application.services.orchestrator import (
     VoiceWorkflowOrchestrator,
     WorkflowResult,
 )
-from vaaniflow.domain.models.principal import Principal, Role
+from vaaniflow.application.services.run_access import authorize_instruction
+from vaaniflow.domain.models.approval import ApprovalStatus
+from vaaniflow.domain.models.principal import (
+    AuthorizationError,
+    Permission,
+    Principal,
+    require_permission,
+)
 from vaaniflow.domain.models.voice_run import VoiceRunStatus
 from vaaniflow.evaluation.runner import EvaluationRunner
 from vaaniflow.infrastructure.repositories.synthetic_data import (
     SYNTHETIC_BUSINESS_TIME,
     SyntheticRepositories,
+)
+from vaaniflow.presentation.telegram_security import (
+    CallbackAction,
+    TelegramIdentityProvider,
+    approve_data,
+    clarify_data,
+    confirm_data,
+    install_token_redaction,
+    parse_callback,
+    redact,
+    reject_data,
 )
 
 logger = logging.getLogger("vaaniflow.telegram")
@@ -36,23 +54,23 @@ class TelegramUser:
     username: str | None = None
 
     @property
-    def principal_id(self) -> UUID:
-        """Deterministic UUID generated from the Telegram user ID."""
-        return uuid5(NAMESPACE_DNS, f"telegram:user:{self.user_id}")
+    def display_name(self) -> str:
+        return f"@{self.username}" if self.username else self.first_name
 
-    @property
-    def principal(self) -> Principal:
-        """Authenticated principal representation for VaaniFlow RBAC."""
-        display = f"@{self.username}" if self.username else self.first_name
-        return Principal(
-            principal_id=self.principal_id,
-            username=display,
-            role=Role.OPERATOR,
-        )
+    # A Telegram user id is an external identifier, not a VaaniFlow actor id or role.
+    # Only the explicit allowlist (TelegramIdentityProvider) turns it into a Principal.
+
+
+class TelegramAPIError(RuntimeError):
+    """A Telegram Bot API failure. The message never contains the bot token."""
+
+    def __init__(self, message: str, *, transient: bool = False) -> None:
+        super().__init__(message)
+        self.transient = transient
 
 
 class TelegramClient:
-    """Async client for Telegram Bot HTTP API with zero extra dependencies."""
+    """Async client for the Telegram Bot HTTP API. Errors are sanitized (no token)."""
 
     BASE_URL = "https://api.telegram.org"
 
@@ -75,24 +93,47 @@ class TelegramClient:
         if not self._external_client:
             await self._client.aclose()
 
+    async def _send(self, api_method: str, url: str, **kwargs: Any) -> httpx.Response:
+        """One HTTP call. Any failure becomes a TelegramAPIError without the URL/token."""
+        try:
+            response = await self._client.request(url=url, **kwargs)
+            response.raise_for_status()
+            return response
+        except httpx.HTTPStatusError as exc:
+            raise TelegramAPIError(
+                f"Telegram {api_method} failed: HTTP {exc.response.status_code}"
+            ) from None
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            raise TelegramAPIError(
+                f"Telegram {api_method} failed: {type(exc).__name__}", transient=True
+            ) from None
+        except httpx.HTTPError as exc:
+            raise TelegramAPIError(f"Telegram {api_method} failed: {type(exc).__name__}") from None
+
+    async def _call(self, api_method: str, http_method: str = "POST", **kwargs: Any) -> Any:
+        response = await self._send(
+            api_method, f"{self.endpoint}/{api_method}", method=http_method, **kwargs
+        )
+        try:
+            data = response.json()
+        except ValueError:
+            raise TelegramAPIError(f"Telegram {api_method} returned invalid JSON") from None
+        if not isinstance(data, dict) or not data.get("ok"):
+            description = data.get("description") if isinstance(data, dict) else None
+            raise TelegramAPIError(
+                f"Telegram {api_method} error: {redact(str(description), self.token)}"
+            )
+        return data.get("result")
+
     async def get_me(self) -> dict[str, Any]:
-        resp = await self._client.get(f"{self.endpoint}/getMe")
-        resp.raise_for_status()
-        data = resp.json()
-        if not data.get("ok"):
-            raise RuntimeError(f"Telegram API error: {data.get('description')}")
-        return data["result"]
+        result: dict[str, Any] = await self._call("getMe", "GET")
+        return result
 
     async def get_updates(self, offset: int = 0, timeout: int = 25) -> list[dict[str, Any]]:
-        resp = await self._client.get(
-            f"{self.endpoint}/getUpdates",
-            params={"offset": offset, "timeout": timeout},
+        result: list[dict[str, Any]] = await self._call(
+            "getUpdates", "GET", params={"offset": offset, "timeout": timeout}
         )
-        resp.raise_for_status()
-        data = resp.json()
-        if not data.get("ok"):
-            raise RuntimeError(f"Telegram getUpdates error: {data.get('description')}")
-        return data["result"]
+        return result
 
     async def send_message(
         self,
@@ -108,9 +149,8 @@ class TelegramClient:
         }
         if reply_markup:
             payload["reply_markup"] = reply_markup
-        resp = await self._client.post(f"{self.endpoint}/sendMessage", json=payload)
-        resp.raise_for_status()
-        return resp.json()["result"]
+        result: dict[str, Any] = await self._call("sendMessage", json=payload)
+        return result
 
     async def edit_message_text(
         self,
@@ -128,9 +168,8 @@ class TelegramClient:
         }
         if reply_markup is not None:
             payload["reply_markup"] = reply_markup
-        resp = await self._client.post(f"{self.endpoint}/editMessageText", json=payload)
-        resp.raise_for_status()
-        return resp.json()["result"]
+        result: dict[str, Any] = await self._call("editMessageText", json=payload)
+        return result
 
     async def answer_callback_query(
         self,
@@ -144,19 +183,17 @@ class TelegramClient:
         }
         if text:
             payload["text"] = text
-        resp = await self._client.post(f"{self.endpoint}/answerCallbackQuery", json=payload)
-        resp.raise_for_status()
-        return resp.json().get("ok", False)
+        return bool(await self._call("answerCallbackQuery", json=payload))
 
     async def get_file(self, file_id: str) -> dict[str, Any]:
-        resp = await self._client.get(f"{self.endpoint}/getFile", params={"file_id": file_id})
-        resp.raise_for_status()
-        return resp.json()["result"]
+        result: dict[str, Any] = await self._call("getFile", "GET", params={"file_id": file_id})
+        return result
 
     async def download_file(self, file_path: str) -> bytes:
-        resp = await self._client.get(f"{self.file_endpoint}/{file_path}")
-        resp.raise_for_status()
-        return resp.content
+        response = await self._send(
+            "downloadFile", f"{self.file_endpoint}/{file_path}", method="GET"
+        )
+        return response.content
 
 
 def convert_audio_to_pcm16_wav(audio_bytes: bytes) -> bytes:
@@ -213,15 +250,21 @@ class VaaniFlowTelegramBot:
         orchestrator: VoiceWorkflowOrchestrator | None = None,
         repositories: SyntheticRepositories | None = None,
         client: TelegramClient | None = None,
+        identity: TelegramIdentityProvider | None = None,
     ) -> None:
+        # Unset TELEGRAM_PRINCIPALS → nobody is allowlisted; malformed → raises here.
+        self.identity = identity or TelegramIdentityProvider.from_env()
+        self._token = token
+        if len(token) >= 8:
+            install_token_redaction(token)
         self.repositories = repositories or SyntheticRepositories()
         self.orchestrator = orchestrator or VoiceWorkflowOrchestrator(
             repositories=self.repositories,
             clock=lambda: SYNTHETIC_BUSINESS_TIME,
         )
         self.client = client or TelegramClient(token=token)
-        # In-memory mapping of chat_id to active run for multi-turn clarification
-        self.active_runs: dict[int, UUID] = {}
+        # Active run per authenticated principal (never per chat): in-memory only.
+        self.active_runs: dict[UUID, UUID] = {}
         # Track pending approval IDs per run
         self.pending_approvals: dict[UUID, UUID] = {}
 
@@ -283,17 +326,21 @@ class VaaniFlowTelegramBot:
                     [
                         {
                             "text": "✅ Approve Dispatch (₹1,07,520)",
-                            "callback_data": f"approve:{result.run.run_id}:{result.approval.approval_id}",
+                            "callback_data": approve_data(
+                                result.run.run_id, result.approval.approval_id
+                            ),
                         }
                     ],
                     [
                         {
                             "text": "❓ Clarify Instruction",
-                            "callback_data": f"clarify:{result.run.run_id}",
+                            "callback_data": clarify_data(result.run.run_id),
                         },
                         {
                             "text": "❌ Reject",
-                            "callback_data": f"reject:{result.run.run_id}:{result.approval.approval_id}",
+                            "callback_data": reject_data(
+                                result.run.run_id, result.approval.approval_id
+                            ),
                         },
                     ],
                 ]
@@ -342,12 +389,22 @@ class VaaniFlowTelegramBot:
             f"<code>Run: {run_id_short}</code>\n"
             f"<b>Message:</b> {result.message}"
         )
+        if result.run.status is VoiceRunStatus.CONFIRMATION_REQUIRED and result.confirmation:
+            confirm_markup = {
+                "inline_keyboard": [
+                    [
+                        {"text": "Yes", "callback_data": confirm_data(result.run.run_id, "yes")},
+                        {"text": "No", "callback_data": confirm_data(result.run.run_id, "no")},
+                    ]
+                ]
+            }
+            return text, confirm_markup
         return text, None
 
     def format_approved_card(
         self,
         result: WorkflowResult,
-        approver_name: str,
+        approver: Principal,
     ) -> str:
         """Format verified post-approval execution receipt."""
         run_id_short = str(result.run.run_id)[:8]
@@ -367,7 +424,8 @@ class VaaniFlowTelegramBot:
         return (
             f"✅ <b>Order Approved &amp; Executed</b>\n"
             f"<code>Run: {run_id_short} | Snapshot Verified: {snap}</code>\n"
-            f"<b>Authorized by:</b> {approver_name} [OWNER]\n\n"
+            f"<b>Authorized by:</b> {approver.display_name} "
+            f"[{', '.join(r.value for r in approver.roles)}] via {approver.authentication_method}\n\n"
             f"📦 <b>Verified Business Records:</b>\n"
             f"{steps_text}\n\n"
             f"🛡 <b>Post-Write Audit:</b> Read-Back Verification passed for 3/3 records.\n"
@@ -379,21 +437,97 @@ class VaaniFlowTelegramBot:
     # ------------------------------------------------------------------ #
 
     async def handle_update(self, update: dict[str, Any]) -> None:
-        """Handle a single Telegram webhook/polling update."""
-        if "message" in update:
-            await self._handle_message(update["message"])
-        elif "callback_query" in update:
-            await self._handle_callback(update["callback_query"])
+        """
+        Handle one Telegram update. This is the error boundary: a failure in one
+        update is logged (token-redacted) and never stops the polling loop.
+        """
+        update_id = update.get("update_id")
+        try:
+            if "message" in update:
+                await self._handle_message(update["message"])
+            elif "callback_query" in update:
+                await self._handle_callback(update["callback_query"])
+        except TelegramAPIError as exc:
+            logger.warning("Telegram API error while handling update %s: %s", update_id, exc)
+        except Exception as exc:  # noqa: BLE001 - per-update boundary: logged, loop survives
+            logger.error(
+                "Unhandled %s while handling update %s: %s",
+                type(exc).__name__,
+                update_id,
+                redact(str(exc), self._token),
+            )
+            await self._notify_internal_error(update)
+
+    async def _notify_internal_error(self, update: dict[str, Any]) -> None:
+        message = update.get("message") or (update.get("callback_query") or {}).get("message")
+        chat_id = (message or {}).get("chat", {}).get("id") if isinstance(message, dict) else None
+        if not isinstance(chat_id, int):
+            return
+        try:
+            await self.client.send_message(
+                chat_id,
+                "⚠️ An internal error occurred. Nothing was retried automatically; "
+                "check the run before trying again.",
+            )
+        except TelegramAPIError as exc:
+            logger.warning("Could not report an internal error to the chat: %s", exc)
+
+    # ------------------------------------------------------------------ #
+    # Identity (ADR-022): private chat + allowlisted Telegram user → Principal
+    # ------------------------------------------------------------------ #
+
+    def _authenticate(
+        self, chat: dict[str, Any], sender: dict[str, Any]
+    ) -> tuple[Principal | None, str]:
+        """The allowlisted principal behind this update, or (None, reason)."""
+        user_id = sender.get("id")
+        if chat.get("type") != "private":
+            return None, "VaaniFlow only works in a private chat with an allowlisted user."
+        if type(user_id) is not int or sender.get("is_bot") or chat.get("id") != user_id:
+            return None, "This update does not come from a single Telegram user."
+        principal = self.identity.authenticate(user_id)
+        if principal is None:
+            return None, (
+                f"You are not on this bot's allowlist (Telegram user id {user_id}). "
+                "Nothing was done."
+            )
+        return principal, ""
+
+    @staticmethod
+    def _refusal(error: AuthorizationError | ApprovalFlowError) -> str:
+        return f"⛔ Not done ({error.code}): {error.message}"
 
     async def _handle_message(self, message: dict[str, Any]) -> None:
-        chat_id = message["chat"]["id"]
-        from_data = message.get("from", {})
-        user = TelegramUser(
-            user_id=from_data.get("id", 0),
-            is_bot=from_data.get("is_bot", False),
-            first_name=from_data.get("first_name", "User"),
-            username=from_data.get("username"),
-        )
+        chat = message.get("chat") or {}
+        chat_id = chat.get("id")
+        if not isinstance(chat_id, int):
+            return
+        principal, reason = self._authenticate(chat, message.get("from") or {})
+        if principal is None:
+            await self.client.send_message(chat_id, f"⛔ {reason}")
+            return
+
+        text = (message.get("text") or "").strip()
+        if text.startswith(("/start", "/help")):
+            await self._send_welcome(chat_id, principal)
+            return
+        if text.startswith("/benchmark"):
+            await self._run_benchmark(chat_id)
+            return
+        if text.startswith("/status"):
+            await self._run_status(chat_id)
+            return
+
+        # Everything below submits an instruction.
+        try:
+            require_permission(principal, Permission.SUBMIT_INSTRUCTION)
+        except AuthorizationError as error:
+            await self.client.send_message(chat_id, self._refusal(error))
+            return
+
+        if text.startswith("/demo"):
+            await self._run_demo(chat_id, principal)
+            return
 
         # 1. Voice Note Intake
         if "voice" in message:
@@ -414,202 +548,193 @@ class VaaniFlowTelegramBot:
 
             # In production, pass WAV to Gnani STT; if caption provided or demo utterance, use it
             spoken_text = message.get("caption") or self.CANONICAL_DEMO_TEXT
-
-            run = self.orchestrator.start_run(
-                owner_id=user.principal_id, now=SYNTHETIC_BUSINESS_TIME
-            )
-            self.active_runs[chat_id] = run.run_id
-
-            result = self.orchestrator.process_text(
-                text=spoken_text,
-                run_id=run.run_id,
-                now=SYNTHETIC_BUSINESS_TIME,
-            )
-
-            card_text, markup = self.format_workflow_card(result, spoken_text)
-            await self.client.send_message(chat_id, card_text, reply_markup=markup)
+            await self._instruct(chat_id, principal, spoken_text, new_run=True)
             return
 
         # 2. Text Message Intake
-        text = message.get("text", "").strip()
         if not text:
             return
+        await self._instruct(chat_id, principal, text, new_run=False)
 
-        # Command handling
-        if text.startswith(("/start", "/help")):
-            welcome = (
-                f"👋 <b>Welcome to VaaniFlow, {user.first_name}!</b>\n\n"
-                f"VaaniFlow is a <b>deterministic voice-to-action engine</b> for wholesale distributor yards.\n\n"
-                f"<b>How to use:</b>\n"
-                f"1. 🎙️ <b>Send a Voice Note:</b> Tap the mic and speak in Hinglish or English.\n"
-                f'2. ✍️ <b>Type an instruction:</b> e.g. <i>"Sharma Builders ko 200 bag cement bhejo parso ke rate pe"</i>\n'
-                f"3. 🧪 <b>Tap /demo:</b> Run the canonical Ramesh voice note demo instantly.\n"
-                f"4. 📊 <b>Tap /benchmark:</b> Inspect the 10/10 automated evaluation scorecard."
+    async def _instruct(
+        self, chat_id: int, principal: Principal, text: str, *, new_run: bool
+    ) -> None:
+        """Send an instruction to the principal's own open run, or to a new run they own."""
+        run = None
+        active_run_id = None if new_run else self.active_runs.get(principal.principal_id)
+        if active_run_id is not None:
+            run = self.repositories.runs.get_by_id(run_id=active_run_id)
+        if run is not None:
+            try:
+                authorize_instruction(principal, run)
+            except AuthorizationError as error:
+                if error.code not in {"RUN_CLOSED", "RUN_ESCALATED"}:
+                    await self.client.send_message(chat_id, self._refusal(error))
+                    return
+                # A settled or escalated run is never reopened: start a new one.
+                run = None
+            else:
+                await self.client.send_message(
+                    chat_id,
+                    f"🔄 <i>Applying instruction to active run <code>{str(run.run_id)[:8]}</code>...</i>",
+                )
+        if run is None:
+            run = self.orchestrator.start_run(
+                owner_id=principal.principal_id, now=SYNTHETIC_BUSINESS_TIME
             )
-            markup = {
-                "inline_keyboard": [
-                    [{"text": "🧪 Run Canonical Demo", "callback_data": "cmd:demo"}],
-                    [
-                        {"text": "📊 Evaluation Lab (A-J)", "callback_data": "cmd:bench"},
-                        {"text": "ℹ️ System Status", "callback_data": "cmd:status"},
-                    ],
-                ]
-            }
-            await self.client.send_message(chat_id, welcome, reply_markup=markup)
-            return
-
-        if text.startswith("/demo"):
-            await self._run_demo(chat_id, user)
-            return
-
-        if text.startswith("/benchmark"):
-            await self._run_benchmark(chat_id)
-            return
-
-        if text.startswith("/status"):
-            await self._run_status(chat_id)
-            return
-
-        # Check if chat is clarifying an existing active run
-        active_run_id = self.active_runs.get(chat_id)
-        if active_run_id:
-            await self.client.send_message(
-                chat_id,
-                f"🔄 <i>Applying instruction to active run <code>{str(active_run_id)[:8]}</code>...</i>",
-            )
-            result = self.orchestrator.process_text(
-                text=text,
-                run_id=active_run_id,
-                now=SYNTHETIC_BUSINESS_TIME,
-            )
-            card_text, markup = self.format_workflow_card(result, text)
-            await self.client.send_message(chat_id, card_text, reply_markup=markup)
-            return
-
-        # New instruction
-        run = self.orchestrator.start_run(owner_id=user.principal_id, now=SYNTHETIC_BUSINESS_TIME)
-        self.active_runs[chat_id] = run.run_id
+        self.active_runs[principal.principal_id] = run.run_id
         result = self.orchestrator.process_text(
             text=text, run_id=run.run_id, now=SYNTHETIC_BUSINESS_TIME
         )
         card_text, markup = self.format_workflow_card(result, text)
         await self.client.send_message(chat_id, card_text, reply_markup=markup)
 
-    async def _handle_callback(self, query: dict[str, Any]) -> None:
-        query_id = query["id"]
-        data = query.get("data", "")
-        message = query.get("message", {})
-        chat_id = message.get("chat", {}).get("id")
-        message_id = message.get("message_id")
-        from_data = query.get("from", {})
-        user = TelegramUser(
-            user_id=from_data.get("id", 0),
-            is_bot=from_data.get("is_bot", False),
-            first_name=from_data.get("first_name", "Approver"),
-            username=from_data.get("username"),
+    async def _send_welcome(self, chat_id: int, principal: Principal) -> None:
+        welcome = (
+            f"👋 <b>Welcome to VaaniFlow, {principal.display_name}!</b>\n\n"
+            f"VaaniFlow is a <b>deterministic voice-to-action engine</b> for wholesale distributor yards.\n\n"
+            f"<b>How to use:</b>\n"
+            f"1. 🎙️ <b>Send a Voice Note:</b> Tap the mic and speak in Hinglish or English.\n"
+            f'2. ✍️ <b>Type an instruction:</b> e.g. <i>"Sharma Builders ko 200 bag cement bhejo parso ke rate pe"</i>\n'
+            f"3. 🧪 <b>Tap /demo:</b> Run the canonical Ramesh voice note demo instantly.\n"
+            f"4. 📊 <b>Tap /benchmark:</b> Inspect the 10/10 automated evaluation scorecard."
         )
+        markup = {
+            "inline_keyboard": [
+                [{"text": "🧪 Run Canonical Demo", "callback_data": "cmd:demo"}],
+                [
+                    {"text": "📊 Evaluation Lab (A-J)", "callback_data": "cmd:bench"},
+                    {"text": "ℹ️ System Status", "callback_data": "cmd:status"},
+                ],
+            ]
+        }
+        await self.client.send_message(chat_id, welcome, reply_markup=markup)
 
-        if data == "cmd:demo":
-            await self.client.answer_callback_query(query_id, "Running canonical demo...")
-            if chat_id:
-                await self._run_demo(chat_id, user)
+    async def _handle_callback(self, query: dict[str, Any]) -> None:
+        query_id = query.get("id")
+        if not isinstance(query_id, str):
+            return
+        message = query.get("message") or {}
+        chat = message.get("chat") or {}
+        chat_id = chat.get("id")
+        message_id = message.get("message_id")
+
+        # callback_data is untrusted: it names targets only, never identity or roles.
+        parsed = parse_callback(query.get("data"))
+        if parsed is None:
+            logger.info("Rejected malformed callback data (%d chars)", len(str(query.get("data"))))
+            await self.client.answer_callback_query(
+                query_id, "This button is not valid.", show_alert=True
+            )
             return
 
-        if data == "cmd:bench":
-            await self.client.answer_callback_query(query_id, "Running evaluation suite...")
-            if chat_id:
-                await self._run_benchmark(chat_id)
+        principal, reason = self._authenticate(chat, query.get("from") or {})
+        if principal is None or not isinstance(chat_id, int):
+            await self.client.answer_callback_query(
+                query_id, reason or "Not authorised.", show_alert=True
+            )
             return
 
-        if data == "cmd:status":
+        try:
+            await self._dispatch_callback(parsed, principal, query_id, chat_id, message_id)
+        except (AuthorizationError, ApprovalFlowError) as error:
+            # Authorization or stale-state refusal: nothing was changed.
+            await self.client.answer_callback_query(query_id, self._refusal(error), show_alert=True)
+
+    async def _dispatch_callback(
+        self,
+        parsed: CallbackAction,
+        principal: Principal,
+        query_id: str,
+        chat_id: int,
+        message_id: Any,
+    ) -> None:
+        if parsed.action == "cmd":
             await self.client.answer_callback_query(query_id)
-            if chat_id:
+            if parsed.command == "demo":
+                require_permission(principal, Permission.SUBMIT_INSTRUCTION)
+                await self._run_demo(chat_id, principal)
+            elif parsed.command == "bench":
+                await self._run_benchmark(chat_id)
+            else:
                 await self._run_status(chat_id)
             return
 
-        if data.startswith("approve:"):
-            parts = data.split(":")
-            if len(parts) != 3:
-                await self.client.answer_callback_query(
-                    query_id, "Invalid approval payload.", show_alert=True
-                )
+        assert parsed.run_id is not None  # guaranteed by parse_callback for run actions
+        if parsed.action == "approve":
+            assert parsed.approval_id is not None
+            # The orchestrator enforces APPROVE (OWNER), the approval↔run binding and
+            # that the approval is still pending against current state.
+            result = self.orchestrator.approve(
+                run_id=parsed.run_id,
+                approval_id=parsed.approval_id,
+                actor=principal,
+                now=SYNTHETIC_BUSINESS_TIME,
+            )
+            if result.approval is None or result.approval.status is not ApprovalStatus.APPROVED:
+                # Stale against current state (e.g. the business snapshot changed and the
+                # approval expired): nothing executed; say so instead of a receipt.
+                await self.client.answer_callback_query(query_id, result.message, show_alert=True)
                 return
-
-            run_id = UUID(parts[1])
-            approval_id = UUID(parts[2])
-
-            try:
-                result = self.orchestrator.approve(
-                    run_id=run_id,
-                    approval_id=approval_id,
-                    approved_by=user.principal_id,
-                    now=SYNTHETIC_BUSINESS_TIME,
-                )
-                await self.client.answer_callback_query(query_id, "✅ Dispatch Plan Approved!")
-                approved_text = self.format_approved_card(
-                    result, user.principal.username or user.first_name
-                )
-                if chat_id and message_id:
-                    await self.client.edit_message_text(chat_id, message_id, approved_text)
-            except ApprovalFlowError as exc:
-                await self.client.answer_callback_query(
-                    query_id, f"⚠️ Error: {exc.message}", show_alert=True
+            await self.client.answer_callback_query(query_id, "Approval recorded.")
+            if isinstance(message_id, int):
+                await self.client.edit_message_text(
+                    chat_id, message_id, self.format_approved_card(result, principal)
                 )
             return
 
-        if data.startswith("reject:"):
-            parts = data.split(":")
-            run_id = UUID(parts[1])
-            approval_id = UUID(parts[2])
-            try:
-                self.orchestrator.reject(
-                    run_id=run_id,
-                    approval_id=approval_id,
-                    rejected_by=user.principal_id,
-                    now=SYNTHETIC_BUSINESS_TIME,
-                )
-                await self.client.answer_callback_query(query_id, "Plan rejected.")
-                if chat_id and message_id:
-                    await self.client.edit_message_text(
-                        chat_id,
-                        message_id,
-                        f"❌ <b>Execution Plan Rejected</b>\n<code>Run: {str(run_id)[:8]}</code>\n<i>Rejected by {user.first_name}. No database writes were committed.</i>",
-                    )
-            except ApprovalFlowError as exc:
-                await self.client.answer_callback_query(
-                    query_id, f"Error: {exc.message}", show_alert=True
-                )
-            return
-
-        if data.startswith("clarify:"):
-            run_id = UUID(data.split(":")[1])
-            self.active_runs[chat_id] = run_id
-            await self.client.answer_callback_query(query_id)
-            if chat_id:
-                await self.client.send_message(
+        if parsed.action == "reject":
+            assert parsed.approval_id is not None
+            self.orchestrator.reject(
+                run_id=parsed.run_id,
+                approval_id=parsed.approval_id,
+                actor=principal,
+                now=SYNTHETIC_BUSINESS_TIME,
+            )
+            await self.client.answer_callback_query(query_id, "Plan rejected.")
+            if isinstance(message_id, int):
+                await self.client.edit_message_text(
                     chat_id,
-                    f"✍️ <i>Please send your clarification or correction for run <code>{str(run_id)[:8]}</code> (e.g. 'actually 220 bags' or 'cancel dispatch').</i>",
+                    message_id,
+                    f"❌ <b>Execution Plan Rejected</b>\n<code>Run: {str(parsed.run_id)[:8]}</code>\n<i>Rejected by {principal.display_name}. No database writes were committed.</i>",
                 )
             return
 
-    async def _run_demo(self, chat_id: int, user: TelegramUser) -> None:
-        """Run the canonical Hinglish demo voice instruction."""
+        if parsed.action == "confirm":
+            assert parsed.reply is not None
+            # The orchestrator enforces CONFIRM, run ownership and that the
+            # confirmation is still pending; a stale reply changes nothing.
+            result = self.orchestrator.confirm(
+                run_id=parsed.run_id,
+                reply=parsed.reply,
+                actor=principal,
+                now=SYNTHETIC_BUSINESS_TIME,
+            )
+            await self.client.answer_callback_query(query_id)
+            card_text, markup = self.format_workflow_card(result, result.message)
+            await self.client.send_message(chat_id, card_text, reply_markup=markup)
+            return
+
+        # clarify: the callback's run id is untrusted; the shared run rules decide.
+        run = self.repositories.runs.get_by_id(run_id=parsed.run_id)
+        if run is None:
+            raise AuthorizationError("RUN_NOT_FOUND", "That run no longer exists.")
+        authorize_instruction(principal, run)
+        self.active_runs[principal.principal_id] = run.run_id
+        await self.client.answer_callback_query(query_id)
+        await self.client.send_message(
+            chat_id,
+            f"✍️ <i>Please send your clarification or correction for run <code>{str(run.run_id)[:8]}</code> (e.g. 'actually 220 bags' or 'cancel dispatch').</i>",
+        )
+
+    async def _run_demo(self, chat_id: int, principal: Principal) -> None:
+        """Run the canonical Hinglish demo voice instruction as the principal's new run."""
         demo_text = self.CANONICAL_DEMO_TEXT
         await self.client.send_message(
             chat_id,
             f'🎙️ <i>Simulating incoming WhatsApp voice note from Yard Owner...</i>\n\n<i>"{demo_text}"</i>',
         )
-
-        run = self.orchestrator.start_run(owner_id=user.principal_id, now=SYNTHETIC_BUSINESS_TIME)
-        self.active_runs[chat_id] = run.run_id
-
-        result = self.orchestrator.process_text(
-            text=demo_text,
-            run_id=run.run_id,
-            now=SYNTHETIC_BUSINESS_TIME,
-        )
-        card_text, markup = self.format_workflow_card(result, demo_text)
-        await self.client.send_message(chat_id, card_text, reply_markup=markup)
+        await self._instruct(chat_id, principal, demo_text, new_run=True)
 
     async def _run_benchmark(self, chat_id: int) -> None:
         """Run the evaluation suite across all 10 canonical failure scenarios."""
@@ -658,31 +783,29 @@ class VaaniFlowTelegramBot:
         """Start resilient long polling for updates."""
         try:
             bot_info = await self.client.get_me()
-            username = bot_info.get("username", "unknown")
-            logger.info(f"Connected to Telegram as @{username} (ID: {bot_info.get('id')})")
-            print(f"🚀 VaaniFlow Telegram Bot is live as @{username}!")
-            print("Listening for voice notes and text messages (Ctrl+C to stop)...")
-        except Exception as exc:
-            logger.error(f"Failed to connect to Telegram: {exc}")
+        except TelegramAPIError as exc:
+            logger.error("Failed to connect to Telegram: %s", exc)
             raise
+        username = bot_info.get("username", "unknown")
+        logger.info("Connected to Telegram as @%s (ID: %s)", username, bot_info.get("id"))
+        print(f"🚀 VaaniFlow Telegram Bot is live as @{username}!")
+        print("Listening for voice notes and text messages (Ctrl+C to stop)...")
 
         offset = 0
         while True:
             try:
                 updates = await self.client.get_updates(offset=offset, timeout=20)
-                for update in updates:
-                    offset = max(offset, update["update_id"] + 1)
-                    try:
-                        await self.handle_update(update)
-                    except (httpx.HTTPError, RuntimeError, ValueError):
-                        logger.exception("Error handling update %s", update.get("update_id"))
-            except (httpx.TimeoutException, httpx.NetworkError):
-                continue
             except asyncio.CancelledError:
                 break
-            except (httpx.HTTPError, RuntimeError) as exc:
-                logger.error("Polling loop exception: %s", exc)
-                await asyncio.sleep(2.0)
+            except TelegramAPIError as exc:
+                if not exc.transient:
+                    logger.error("Polling error: %s", exc)
+                    await asyncio.sleep(2.0)
+                continue
+            for update in updates:
+                if isinstance(update.get("update_id"), int):
+                    offset = max(offset, update["update_id"] + 1)
+                await self.handle_update(update)  # never raises (per-update boundary)
 
 
 async def run_bot() -> None:
@@ -692,8 +815,15 @@ async def run_bot() -> None:
         print("❌ Error: TELEGRAM_BOT_TOKEN environment variable is not set.")
         print("Please export TELEGRAM_BOT_TOKEN='your_token_here' and run again.")
         return
+    try:
+        identity = TelegramIdentityProvider.from_env()
+    except ValueError as exc:
+        print(f"❌ Error: {exc}")
+        return
+    if not identity.has_principals:
+        print("⚠️ TELEGRAM_PRINCIPALS is not set: every Telegram user will be refused.")
 
-    bot = VaaniFlowTelegramBot(token=token)
+    bot = VaaniFlowTelegramBot(token=token, identity=identity)
     try:
         await bot.start_polling()
     finally:

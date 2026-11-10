@@ -1,7 +1,8 @@
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from fastapi.testclient import TestClient
 
+from tests.auth_support import OPERATOR, OTHER_REQUESTER, REQUESTER, auth, provider
 from vaaniflow.api.app import app
 from vaaniflow.api.dependencies import AppContainer, reset_container
 from vaaniflow.domain.models.approval import ApprovalStatus
@@ -21,15 +22,7 @@ SHARMA_INSTRUCTION = (
 
 
 def _fresh_api() -> AppContainer:
-    return reset_container(clock=lambda: T)
-
-
-def _auth_header(user_id: UUID | None = None, role: str | None = None) -> dict[str, str]:
-    uid = user_id or uuid4()
-    headers = {"Authorization": f"Bearer {uid}"}
-    if role:
-        headers["X-Role"] = role
-    return headers
+    return reset_container(clock=lambda: T, identity_provider=provider())
 
 
 # =========================================================================== #
@@ -39,8 +32,7 @@ def _auth_header(user_id: UUID | None = None, role: str | None = None) -> dict[s
 
 def test_anonymous_user_cannot_supersede_pending_approval() -> None:
     container = _fresh_api()
-    user_a = uuid4()
-    headers_a = _auth_header(user_a)
+    headers_a = auth(REQUESTER)
 
     # 1. User A creates a run and submits an instruction that creates a pending approval
     run_id = client.post("/runs", headers=headers_a).json()["run_id"]
@@ -68,8 +60,7 @@ def test_anonymous_user_cannot_supersede_pending_approval() -> None:
 
 def test_anonymous_user_cannot_add_instruction_to_existing_run() -> None:
     _fresh_api()
-    user_a = uuid4()
-    headers_a = _auth_header(user_a)
+    headers_a = auth(REQUESTER)
 
     # User A creates a run
     run_id = client.post("/runs", headers=headers_a).json()["run_id"]
@@ -85,10 +76,8 @@ def test_anonymous_user_cannot_add_instruction_to_existing_run() -> None:
 
 def test_requester_run_ownership_enforced_on_process() -> None:
     _fresh_api()
-    user_a = uuid4()
-    user_b = uuid4()
-    headers_a = _auth_header(user_a)
-    headers_b = _auth_header(user_b)
+    headers_a = auth(REQUESTER)
+    headers_b = auth(OTHER_REQUESTER)
 
     # User A creates a run and processes instruction
     run_id = client.post("/runs", headers=headers_a).json()["run_id"]
@@ -117,10 +106,8 @@ def test_requester_run_ownership_enforced_on_process() -> None:
 
 def test_operator_can_process_instruction_on_any_run() -> None:
     _fresh_api()
-    user_a = uuid4()
-    operator = uuid4()
-    headers_a = _auth_header(user_a)
-    headers_op = _auth_header(operator, role="operator")
+    headers_a = auth(REQUESTER)
+    headers_op = auth(OPERATOR)
 
     run_id = client.post("/runs", headers=headers_a).json()["run_id"]
     client.post(f"/runs/{run_id}/process", json={"text": KUMAR_INSTRUCTION}, headers=headers_a)
@@ -141,8 +128,7 @@ def test_operator_can_process_instruction_on_any_run() -> None:
 
 def test_anonymous_user_cannot_clarify_run() -> None:
     _fresh_api()
-    user_a = uuid4()
-    headers_a = _auth_header(user_a)
+    headers_a = auth(REQUESTER)
 
     # User A creates run requiring clarification (ambiguous product)
     run_id = client.post("/runs", headers=headers_a).json()["run_id"]
@@ -162,10 +148,8 @@ def test_anonymous_user_cannot_clarify_run() -> None:
 
 def test_unauthorized_user_cannot_alter_another_users_run_on_clarify() -> None:
     _fresh_api()
-    user_a = uuid4()
-    user_b = uuid4()
-    headers_a = _auth_header(user_a)
-    headers_b = _auth_header(user_b)
+    headers_a = auth(REQUESTER)
+    headers_b = auth(OTHER_REQUESTER)
 
     # User A creates run requiring clarification
     run_id = client.post("/runs", headers=headers_a).json()["run_id"]
@@ -195,14 +179,14 @@ def test_unauthorized_user_cannot_alter_another_users_run_on_clarify() -> None:
 
 def test_clarification_cannot_silently_reopen_escalated_run() -> None:
     container = _fresh_api()
-    user_a = uuid4()
-    headers_a = _auth_header(user_a)
+    headers_a = auth(REQUESTER)
 
     # User A creates a run and escalates it to human handoff
     run_id = client.post("/runs", headers=headers_a).json()["run_id"]
     handoff_res = client.post(
         f"/runs/{run_id}/handoff",
         json={"reason": "Manual operator escalation"},
+        headers=auth(OPERATOR),
     )
     assert handoff_res.status_code == 200
 

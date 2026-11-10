@@ -18,6 +18,7 @@ from uuid import UUID, uuid4
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.auth_support import STAFF, auth, provider
 from vaaniflow.api.app import app
 from vaaniflow.api.dependencies import (
     BUSINESS_CLOCK_ENV,
@@ -108,9 +109,9 @@ def _approve(
 ) -> WorkflowResult:
     assert result.approval is not None
     return orchestrator.approve(
+        actor=STAFF,
         run_id=result.run.run_id,
         approval_id=result.approval.approval_id,
-        approved_by=uuid4(),
         simulated_faults=faults,
         now=now,
     )
@@ -368,9 +369,9 @@ def test_unknown_invoice_mid_plan_stops_before_dispatch_and_hands_off() -> None:
 def demo_container(monkeypatch: pytest.MonkeyPatch) -> Iterator[AppContainer]:
     """API container on the explicit demo clock; restored to the real clock afterwards."""
     monkeypatch.setenv(BUSINESS_CLOCK_ENV, "synthetic")
-    yield reset_container()
+    yield reset_container(identity_provider=provider())
     monkeypatch.delenv(BUSINESS_CLOCK_ENV)
-    assert reset_container().business_clock_source == "real"
+    assert reset_container(identity_provider=provider()).business_clock_source == "real"
 
 
 def test_canonical_request_over_http_end_to_end(demo_container: AppContainer) -> None:
@@ -378,8 +379,8 @@ def test_canonical_request_over_http_end_to_end(demo_container: AppContainer) ->
     repos = container.repositories
     assert container.business_clock_source.startswith("fixed:")
 
-    run_id = client.post("/runs").json()["run_id"]
-    processed = client.post(f"/runs/{run_id}/process", json={"text": CANONICAL})
+    run_id = client.post("/runs", headers=auth()).json()["run_id"]
+    processed = client.post(f"/runs/{run_id}/process", json={"text": CANONICAL}, headers=auth())
     assert processed.status_code == 200
     body = processed.json()
 
@@ -444,7 +445,9 @@ def test_canonical_request_over_http_end_to_end(demo_container: AppContainer) ->
     assert item["unit_price"] == "420.00" and item["quantity"] == 200
 
     # Owner approves exactly that approval.
-    approved = client.post(f"/runs/{run_id}/approve", json={"approval_id": str(approval_id)})
+    approved = client.post(
+        f"/runs/{run_id}/approve", json={"approval_id": str(approval_id)}, headers=auth()
+    )
     assert approved.status_code == 200
     result = approved.json()
     assert result["status"] == "HANDOFF"  # SEND_NOTIFICATION is unsupported, handed off

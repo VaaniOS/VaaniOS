@@ -5,8 +5,19 @@ from uuid import UUID
 
 import pytest
 
+from vaaniflow.domain.models.approval import ApprovalStatus
+from vaaniflow.domain.models.principal import Principal, Role
 from vaaniflow.infrastructure.repositories.synthetic_data import SyntheticRepositories
 from vaaniflow.presentation.telegram_bot import TelegramClient, VaaniFlowTelegramBot
+from vaaniflow.presentation.telegram_security import TelegramIdentityProvider, decode_id
+
+# Synthetic demo identity: Telegram user 42 is allowlisted as the OWNER "Ramesh".
+RAMESH = Principal(
+    principal_id=UUID("00000000-0000-4000-8000-00000000d042"),
+    display_name="Ramesh (demo owner)",
+    roles=[Role.OWNER, Role.REQUESTER],
+    authentication_method="telegram-allowlist",
+)
 
 
 class MockTelegramClient(TelegramClient):
@@ -94,7 +105,12 @@ def mock_client() -> MockTelegramClient:
 @pytest.fixture
 def bot(mock_client: MockTelegramClient) -> VaaniFlowTelegramBot:
     repos = SyntheticRepositories()
-    return VaaniFlowTelegramBot(token="test_token", repositories=repos, client=mock_client)
+    return VaaniFlowTelegramBot(
+        token="test_token",
+        repositories=repos,
+        client=mock_client,
+        identity=TelegramIdentityProvider({42: RAMESH}),
+    )
 
 
 @pytest.mark.asyncio
@@ -105,7 +121,7 @@ async def test_telegram_start_command(
         "update_id": 1,
         "message": {
             "message_id": 101,
-            "chat": {"id": 999},
+            "chat": {"id": 42, "type": "private"},
             "from": {"id": 42, "first_name": "Ramesh", "username": "ramesh_yard"},
             "text": "/start",
         },
@@ -114,14 +130,14 @@ async def test_telegram_start_command(
 
     assert len(mock_client.sent_messages) == 1
     msg = mock_client.sent_messages[0]
-    assert msg["chat_id"] == 999
-    assert "Welcome to VaaniFlow, Ramesh!" in msg["text"]
+    assert msg["chat_id"] == 42
+    assert "Welcome to VaaniFlow, Ramesh (demo owner)!" in msg["text"]
     assert msg["reply_markup"] is not None
     assert len(msg["reply_markup"]["inline_keyboard"]) >= 2
 
 
 @pytest.mark.asyncio
-async def test_telegram_demo_and_inline_approval_flow(
+async def test_telegram_demo_and_inline_approval_by_allowlisted_owner(
     bot: VaaniFlowTelegramBot,
     mock_client: MockTelegramClient,
 ) -> None:
@@ -130,7 +146,7 @@ async def test_telegram_demo_and_inline_approval_flow(
         "update_id": 2,
         "message": {
             "message_id": 102,
-            "chat": {"id": 999},
+            "chat": {"id": 42, "type": "private"},
             "from": {"id": 42, "first_name": "Ramesh", "username": "ramesh_yard"},
             "text": "/demo",
         },
@@ -154,8 +170,10 @@ async def test_telegram_demo_and_inline_approval_flow(
     assert callback_data.startswith("approve:")
 
     parts = callback_data.split(":")
-    run_id = UUID(parts[1])
-    _ = UUID(parts[2])
+    run_id = decode_id(parts[1])
+    approval_id = decode_id(parts[2])
+    assert run_id is not None and approval_id is not None
+    assert len(callback_data.encode()) <= 64  # Telegram's callback_data limit
 
     # 2. User clicks [Approve Dispatch] inline button
     click_update = {
@@ -163,34 +181,33 @@ async def test_telegram_demo_and_inline_approval_flow(
         "callback_query": {
             "id": "query_777",
             "from": {"id": 42, "first_name": "Ramesh", "username": "ramesh_yard"},
-            "message": {"message_id": approval_card["message_id"], "chat": {"id": 999}},
+            "message": {
+                "message_id": approval_card["message_id"],
+                "chat": {"id": 42, "type": "private"},
+            },
             "data": callback_data,
         },
     }
     await bot.handle_update(click_update)
 
-    # Verify callback answered
+    # The allowlisted OWNER approves; the orchestrator records that principal.
     assert len(mock_client.answered_callbacks) == 1
-    assert "Approved" in (mock_client.answered_callbacks[0]["text"] or "")
-
-    # Verify message was updated with verified execution receipt
+    assert mock_client.answered_callbacks[0]["text"] == "Approval recorded."
     assert len(mock_client.edited_messages) == 1
-    edited = mock_client.edited_messages[0]
-    assert "Order Approved &amp; Executed" in edited["text"]
-    assert "@ramesh_yard [OWNER]" in edited["text"]
-    assert "create_order" in edited["text"]
-    assert "dispatch_order" in edited["text"]
-    assert "VERIFIED" in edited["text"]
-
-    # Verify DB state
+    edited = mock_client.edited_messages[0]["text"]
+    assert "Ramesh (demo owner) [OWNER, REQUESTER] via telegram-allowlist" in edited
     orders = bot.repositories.orders.list_all()
-    assert len(orders) == 1
-    assert orders[0].source_run_id == run_id
-    assert str(orders[0].subtotal) == "84000.00"
+    assert len(orders) == 1 and orders[0].source_run_id == run_id
+    approval = bot.repositories.approvals.get_by_id(approval_id=approval_id)
+    assert approval is not None and approval.status is ApprovalStatus.APPROVED
+    assert approval.approved_by == RAMESH.principal_id and approval.approved_actor == RAMESH
+    assert approval.actor_authenticated is True
+    run = bot.repositories.runs.get_by_id(run_id=run_id)
+    assert run is not None and run.owner_id == RAMESH.principal_id
 
 
 @pytest.mark.asyncio
-async def test_telegram_rejection_flow(
+async def test_telegram_rejection_by_allowlisted_owner(
     bot: VaaniFlowTelegramBot,
     mock_client: MockTelegramClient,
 ) -> None:
@@ -198,7 +215,7 @@ async def test_telegram_rejection_flow(
         "update_id": 4,
         "message": {
             "message_id": 103,
-            "chat": {"id": 888},
+            "chat": {"id": 42, "type": "private"},
             "from": {"id": 42, "first_name": "Ramesh", "username": "ramesh_yard"},
             "text": bot.CANONICAL_DEMO_TEXT,
         },
@@ -218,17 +235,23 @@ async def test_telegram_rejection_flow(
         "callback_query": {
             "id": "query_888",
             "from": {"id": 42, "first_name": "Ramesh", "username": "ramesh_yard"},
-            "message": {"message_id": approval_card["message_id"], "chat": {"id": 888}},
+            "message": {
+                "message_id": approval_card["message_id"],
+                "chat": {"id": 42, "type": "private"},
+            },
             "data": callback_data,
         },
     }
     await bot.handle_update(click_update)
 
-    assert len(mock_client.edited_messages) == 1
-    edited = mock_client.edited_messages[0]
-    assert "Execution Plan Rejected" in edited["text"]
-    assert "No database writes were committed" in edited["text"]
-    assert len(bot.repositories.orders.list_all()) == 0
+    assert mock_client.answered_callbacks[-1]["text"] == "Plan rejected."
+    assert "Execution Plan Rejected" in mock_client.edited_messages[-1]["text"]
+    assert bot.repositories.orders.list_all() == []
+    approval_id = decode_id(callback_data.split(":")[2])
+    assert approval_id is not None
+    approval = bot.repositories.approvals.get_by_id(approval_id=approval_id)
+    assert approval is not None and approval.status is ApprovalStatus.REJECTED
+    assert approval.rejected_by == RAMESH.principal_id and approval.rejected_actor == RAMESH
 
 
 @pytest.mark.asyncio
@@ -240,7 +263,7 @@ async def test_telegram_voice_message_intake(
         "update_id": 6,
         "message": {
             "message_id": 104,
-            "chat": {"id": 777},
+            "chat": {"id": 42, "type": "private"},
             "from": {"id": 42, "first_name": "Ramesh", "username": "ramesh_yard"},
             "voice": {
                 "file_id": "voice_file_abc",
@@ -270,7 +293,7 @@ async def test_telegram_benchmark_and_status_commands(
             "update_id": 7,
             "message": {
                 "message_id": 105,
-                "chat": {"id": 777},
+                "chat": {"id": 42, "type": "private"},
                 "from": {"id": 42, "first_name": "Ramesh"},
                 "text": "/benchmark",
             },
@@ -287,7 +310,7 @@ async def test_telegram_benchmark_and_status_commands(
             "update_id": 8,
             "message": {
                 "message_id": 106,
-                "chat": {"id": 777},
+                "chat": {"id": 42, "type": "private"},
                 "from": {"id": 42, "first_name": "Ramesh"},
                 "text": "/status",
             },

@@ -15,6 +15,7 @@ from uuid import UUID, uuid4
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.auth_support import STAFF, auth, provider
 from vaaniflow.api.app import app
 from vaaniflow.api.dependencies import AppContainer, reset_container
 from vaaniflow.api.routers.runs import _to_response
@@ -100,9 +101,9 @@ def _approve(
 ) -> WorkflowResult:
     assert result.approval is not None
     return orchestrator.approve(
+        actor=STAFF,
         run_id=result.run.run_id,
         approval_id=result.approval.approval_id,
-        approved_by=uuid4(),
         simulated_faults=faults,
         now=now,
     )
@@ -180,12 +181,12 @@ def test_reprocessing_into_clarification_still_supersedes_pending_approval() -> 
 
 
 def _fresh_api() -> AppContainer:
-    return reset_container(clock=lambda: SYNTHETIC_BUSINESS_TIME)
+    return reset_container(clock=lambda: SYNTHETIC_BUSINESS_TIME, identity_provider=provider())
 
 
 def test_clarify_supersedes_old_approval_and_returns_the_new_approval_id() -> None:
     container = _fresh_api()
-    user_headers = {"Authorization": f"Bearer {uuid4()}"}
+    user_headers = auth()
     run_id = client.post("/runs", headers=user_headers).json()["run_id"]
     first = client.post(
         f"/runs/{run_id}/process", json={"text": KUMAR_DISPATCH}, headers=user_headers
@@ -207,12 +208,16 @@ def test_clarify_supersedes_old_approval_and_returns_the_new_approval_id() -> No
     assert body["superseded_approval_ids"] == [first["approval_id"]]
     assert body["planned_tools"] == ["create_order", "dispatch_order"]
 
-    stale = client.post(f"/runs/{run_id}/approve", json={"approval_id": first["approval_id"]})
+    stale = client.post(
+        f"/runs/{run_id}/approve", json={"approval_id": first["approval_id"]}, headers=auth()
+    )
     assert stale.status_code == 409
     assert stale.json()["detail"]["code"] == "APPROVAL_SUPERSEDED"
     assert _writes(container.repositories) == (0, 0, 0)
 
-    current = client.post(f"/runs/{run_id}/approve", json={"approval_id": body["approval_id"]})
+    current = client.post(
+        f"/runs/{run_id}/approve", json={"approval_id": body["approval_id"]}, headers=auth()
+    )
     assert current.status_code == 200
     assert current.json()["status"] == "COMPLETED"
     orders = container.repositories.orders.list_all()

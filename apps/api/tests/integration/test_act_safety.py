@@ -14,6 +14,7 @@ from uuid import uuid4
 
 import pytest
 
+from tests.auth_support import STAFF
 from vaaniflow.application.services.orchestrator import (
     ApprovalFlowError,
     VoiceWorkflowOrchestrator,
@@ -60,9 +61,9 @@ def _writes(repos: SyntheticRepositories) -> tuple[int, int, int]:
 def _approve(orchestrator: VoiceWorkflowOrchestrator, result: WorkflowResult) -> WorkflowResult:
     assert result.approval is not None
     return orchestrator.approve(
+        actor=STAFF,
         run_id=result.run.run_id,
         approval_id=result.approval.approval_id,
-        approved_by=uuid4(),
         now=NOW,
     )
 
@@ -385,9 +386,9 @@ def test_approval_of_run_a_cannot_execute_run_b() -> None:
 
     with pytest.raises(ApprovalFlowError) as error:
         orchestrator.approve(
+            actor=STAFF,
             run_id=run_b.run.run_id,
             approval_id=run_a.approval.approval_id,
-            approved_by=uuid4(),
             now=NOW,
         )
 
@@ -400,9 +401,7 @@ def test_unknown_approval_id_cannot_execute() -> None:
     result = orchestrator.process_text(text=KUMAR_DISPATCH, now=NOW)
 
     with pytest.raises(ApprovalFlowError) as error:
-        orchestrator.approve(
-            run_id=result.run.run_id, approval_id=uuid4(), approved_by=uuid4(), now=NOW
-        )
+        orchestrator.approve(actor=STAFF, run_id=result.run.run_id, approval_id=uuid4(), now=NOW)
 
     assert error.value.code == "APPROVAL_NOT_FOUND"
     assert _writes(repos) == (0, 0, 0)
@@ -414,9 +413,9 @@ def test_rejected_approval_can_never_execute() -> None:
     assert result.approval is not None
 
     rejected = orchestrator.reject(
+        actor=STAFF,
         run_id=result.run.run_id,
         approval_id=result.approval.approval_id,
-        rejected_by=uuid4(),
         now=NOW,
     )
     assert rejected.run.status is VoiceRunStatus.BLOCKED
@@ -473,9 +472,9 @@ def test_unchanged_business_state_keeps_the_approval_valid_over_time() -> None:
     assert result.approval is not None
 
     executed = orchestrator.approve(
+        actor=STAFF,
         run_id=result.run.run_id,
         approval_id=result.approval.approval_id,
-        approved_by=uuid4(),
         now=NOW + timedelta(hours=1),
     )
 
