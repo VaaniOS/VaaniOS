@@ -1,5 +1,4 @@
-from uuid import uuid4
-
+from tests.auth_support import STAFF
 from vaaniflow.application.services.orchestrator import VoiceWorkflowOrchestrator
 from vaaniflow.domain.models.voice_run import VoiceRunStatus
 from vaaniflow.domain.policies.decision import DecisionType
@@ -32,9 +31,9 @@ def test_orchestrator_full_happy_path_with_approval() -> None:
 
     # 2. The owner approves that approval; exactly the stored plan executes.
     result2 = orchestrator.approve(
+        actor=STAFF,
         run_id=result1.run.run_id,
         approval_id=result1.approval.approval_id,
-        approved_by=uuid4(),
         now=_NOW,
     )
 

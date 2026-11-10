@@ -3,7 +3,16 @@ from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, status
 
-from vaaniflow.api.auth import PrincipalDep
+from vaaniflow.api.auth import (
+    ApproverDep,
+    AuditorDep,
+    AuthenticatedDep,
+    ConfirmerDep,
+    EscalatorDep,
+    InstructorDep,
+    ResolverDep,
+    authorization_http_error,
+)
 from vaaniflow.api.dependencies import AppContainer, ContainerDep
 from vaaniflow.api.schemas import (
     ApproveRequest,
@@ -22,8 +31,8 @@ from vaaniflow.api.schemas import (
 )
 from vaaniflow.application.services.audit import RunAuditService
 from vaaniflow.application.services.orchestrator import ApprovalFlowError, WorkflowResult
-from vaaniflow.domain.models.approval import ApprovalStatus
-from vaaniflow.domain.models.principal import Role
+from vaaniflow.application.services.run_access import authorize_instruction, authorize_run_read
+from vaaniflow.domain.models.principal import AuthorizationError, Principal
 from vaaniflow.domain.models.tool_execution import ToolExecutionStatus
 from vaaniflow.domain.models.voice_run import VoiceRun, VoiceRunStatus
 from vaaniflow.execution.service import OperatorResolutionError
@@ -31,6 +40,8 @@ from vaaniflow.execution.service import OperatorResolutionError
 router = APIRouter(prefix="/runs", tags=["Runs"])
 
 _APPROVAL_ERROR_STATUS = {
+    "UNAUTHENTICATED": status.HTTP_401_UNAUTHORIZED,
+    "FORBIDDEN": status.HTTP_403_FORBIDDEN,
     "RUN_NOT_FOUND": status.HTTP_404_NOT_FOUND,
     "APPROVAL_NOT_FOUND": status.HTTP_404_NOT_FOUND,
     "APPROVAL_RUN_MISMATCH": status.HTTP_409_CONFLICT,
@@ -116,14 +127,46 @@ def _approval_http_error(error: ApprovalFlowError | OperatorResolutionError) -> 
     )
 
 
+def _run_or_404(container: AppContainer, run_id: UUID) -> VoiceRun:
+    run = container.repositories.runs.get_by_id(run_id=run_id)
+    if not run:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"Run {run_id} not found."
+        )
+    return run
+
+
+def _readable_run(container: AppContainer, run_id: UUID, principal: Principal) -> VoiceRun:
+    run = _run_or_404(container, run_id)
+    try:
+        authorize_run_read(principal, run)
+    except AuthorizationError as error:
+        raise authorization_http_error(error) from error
+    return run
+
+
+def _instructable_run(container: AppContainer, run_id: UUID, principal: Principal) -> VoiceRun:
+    """The run, if ``principal`` may add an instruction to it (ownership, run state)."""
+    run = _run_or_404(container, run_id)
+    try:
+        authorize_instruction(principal, run)
+    except AuthorizationError as error:
+        raise authorization_http_error(error) from error
+    if run.owner_id is None:
+        # A run created without an owner is claimed by its first authenticated instructor.
+        run.owner_id = principal.principal_id
+        container.repositories.runs.save(run=run)
+    return run
+
+
 @router.post("", response_model=CreateRunResponse, status_code=status.HTTP_201_CREATED)
 def create_run(
     container: ContainerDep,
+    principal: InstructorDep,
     payload: CreateRunRequest | None = None,
-    principal: PrincipalDep = None,
 ) -> CreateRunResponse:
-    owner_id = principal.principal_id if principal else None
-    run = container.orchestrator.start_run(owner_id=owner_id)
+    """Create a run owned by the authenticated principal (optionally with an instruction)."""
+    run = container.orchestrator.start_run(owner_id=principal.principal_id)
     if payload and payload.text:
         container.orchestrator.process_text(text=payload.text, run_id=run.run_id)
         refreshed = container.repositories.runs.get_by_id(run_id=run.run_id)
@@ -141,13 +184,9 @@ def create_run(
 def get_run(
     run_id: UUID,
     container: ContainerDep,
+    principal: AuthenticatedDep,
 ) -> dict:
-    run = container.repositories.runs.get_by_id(run_id=run_id)
-    if not run:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Run {run_id} not found.",
-        )
+    run = _readable_run(container, run_id, principal)
     return {
         "run_id": str(run.run_id),
         "owner_id": str(run.owner_id) if run.owner_id else None,
@@ -159,23 +198,12 @@ def get_run(
     }
 
 
-def _has_pending_approval(container: AppContainer, run: VoiceRun) -> bool:
-    if run.status is VoiceRunStatus.APPROVAL_REQUIRED:
-        return True
-    if hasattr(container.repositories, "pending_executions"):
-        for pending in container.repositories.pending_executions.list_by_run(run_id=run.run_id):
-            approval = container.repositories.approvals.get_by_id(approval_id=pending.approval_id)
-            if approval is not None and approval.status is ApprovalStatus.REQUESTED:
-                return True
-    return False
-
-
 @router.post("/{run_id}/process", response_model=WorkflowResponse)
 def process_run(
     run_id: UUID,
     payload: ProcessRunRequest,
     container: ContainerDep,
-    principal: PrincipalDep = None,
+    principal: InstructorDep,
 ) -> WorkflowResponse:
     text = payload.text
     if not text:
@@ -183,56 +211,7 @@ def process_run(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Instruction text must be provided for processing.",
         )
-
-    run = container.repositories.runs.get_by_id(run_id=run_id)
-    if not run:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Run {run_id} not found.",
-        )
-
-    # 1. Prevent anonymous users from superseding an existing pending approval
-    if _has_pending_approval(container, run) and principal is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={
-                "code": "AUTHENTICATION_REQUIRED",
-                "message": "Anonymous users are not permitted to supersede an existing pending approval.",
-            },
-        )
-
-    # 2. Require an authenticated principal when adding an instruction to an existing run
-    is_existing_active_run = (
-        run.owner_id is not None
-        or run.status is not VoiceRunStatus.CREATED
-        or run.transcript_id is not None
-    )
-    if is_existing_active_run and principal is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={
-                "code": "AUTHENTICATION_REQUIRED",
-                "message": "Authenticated principal required when adding an instruction to an existing run.",
-            },
-        )
-
-    # 3. Enforce requester/run ownership
-    if principal is not None:
-        if run.owner_id is None:
-            run.owner_id = principal.principal_id
-            container.repositories.runs.save(run=run)
-        elif run.owner_id != principal.principal_id and principal.role not in (
-            Role.ADMIN,
-            Role.OPERATOR,
-        ):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail={
-                    "code": "FORBIDDEN",
-                    "message": "Principal is not authorized to alter this run; requester ownership violation.",
-                },
-            )
-
+    _instructable_run(container, run_id, principal)
     result = container.orchestrator.process_text(text=text, run_id=run_id)
     return _to_response(result)
 
@@ -241,7 +220,9 @@ def process_run(
 def get_run_trace(
     run_id: UUID,
     container: ContainerDep,
+    principal: AuthenticatedDep,
 ) -> dict:
+    _readable_run(container, run_id, principal)
     trace = container.trace_service.get_run_trace(run_id=run_id)
     if not trace:
         raise HTTPException(
@@ -273,7 +254,9 @@ def get_run_trace(
 def get_run_validation(
     run_id: UUID,
     container: ContainerDep,
+    principal: AuthenticatedDep,
 ) -> dict:
+    _readable_run(container, run_id, principal)
     trace = container.trace_service.get_run_trace(run_id=run_id)
     if not trace:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found.")
@@ -294,13 +277,14 @@ def approve_run(
     run_id: UUID,
     payload: ApproveRequest,
     container: ContainerDep,
+    principal: ApproverDep,
 ) -> WorkflowResponse:
     """Approve one pending approval of this run and execute exactly its stored plan."""
     try:
         result = container.orchestrator.approve(
             run_id=run_id,
             approval_id=payload.approval_id,
-            approved_by=payload.approved_by,
+            actor=principal,
         )
     except ApprovalFlowError as error:
         raise _approval_http_error(error) from error
@@ -312,13 +296,14 @@ def reject_run(
     run_id: UUID,
     payload: RejectRequest,
     container: ContainerDep,
+    principal: ApproverDep,
 ) -> WorkflowResponse:
     """Reject one pending approval of this run; its plan can never execute."""
     try:
         result = container.orchestrator.reject(
             run_id=run_id,
             approval_id=payload.approval_id,
-            rejected_by=payload.rejected_by,
+            actor=principal,
             reason=payload.reason,
         )
     except ApprovalFlowError as error:
@@ -331,60 +316,13 @@ def clarify_run(
     run_id: UUID,
     payload: ClarifyRequest,
     container: ContainerDep,
-    principal: PrincipalDep = None,
+    principal: InstructorDep,
 ) -> WorkflowResponse:
-    run = container.repositories.runs.get_by_id(run_id=run_id)
-    if not run:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found.")
-
-    # 1. Do not allow clarification to silently reopen an escalated run
-    if run.status is VoiceRunStatus.HANDOFF:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={
-                "code": "RUN_ESCALATED",
-                "message": f"Run {run_id} has been escalated to human handoff and cannot be clarified without operator resolution.",
-            },
-        )
-
-    # 2. Require authentication + appropriate authorization
-    if principal is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={
-                "code": "AUTHENTICATION_REQUIRED",
-                "message": "Authentication required to clarify a run.",
-            },
-        )
-
-    # 3. Anonymous users (and unauthorized users) must not be able to reopen or alter another user's run
-    if (
-        run.owner_id is not None
-        and run.owner_id != principal.principal_id
-        and principal.role
-        not in (
-            Role.ADMIN,
-            Role.OPERATOR,
-        )
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={
-                "code": "FORBIDDEN",
-                "message": "Principal is not authorized to alter another user's run.",
-            },
-        )
-
-    if run.owner_id is None:
-        run.owner_id = principal.principal_id
-        container.repositories.runs.save(run=run)
-
-    # Resume with clarified text. Any approval still pending on this run is
-    # superseded; the response carries the new approval_id if one is requested.
-    result = container.orchestrator.process_text(
-        text=payload.clarification,
-        run_id=run_id,
-    )
+    """A complete corrected instruction for the principal's own open run."""
+    _instructable_run(container, run_id, principal)
+    # Any approval still pending on this run is superseded; the response carries
+    # the new approval_id if one is requested.
+    result = container.orchestrator.process_text(text=payload.clarification, run_id=run_id)
     return _to_response(result)
 
 
@@ -393,6 +331,7 @@ def confirm_run(
     run_id: UUID,
     payload: ConfirmRequest,
     container: ContainerDep,
+    principal: ConfirmerDep,
 ) -> WorkflowResponse:
     """Answer the confirmation pending on this run. Never approves or executes."""
     try:
@@ -400,7 +339,7 @@ def confirm_run(
             run_id=run_id,
             reply=payload.reply,
             confirmation_id=payload.confirmation_id,
-            confirmed_by=payload.confirmed_by,
+            actor=principal,
         )
     except ApprovalFlowError as error:
         raise _approval_http_error(error) from error
@@ -413,6 +352,7 @@ def resolve_unknown_execution(
     execution_id: UUID,
     payload: ResolveUnknownRequest,
     container: ContainerDep,
+    principal: ResolverDep,
 ) -> WorkflowResponse:
     """Operator resolution of one UNKNOWN execution, verified against business state."""
     try:
@@ -422,7 +362,7 @@ def resolve_unknown_execution(
             attempt=payload.attempt,
             outcome=ToolExecutionStatus(payload.outcome),
             reason=payload.reason,
-            resolved_by=payload.resolved_by,
+            actor=principal,
             entity_id=payload.entity_id,
         )
     except OperatorResolutionError as error:
@@ -431,7 +371,7 @@ def resolve_unknown_execution(
 
 
 @router.get("/{run_id}/audit")
-def get_run_audit(run_id: UUID, container: ContainerDep) -> dict[str, Any]:
+def get_run_audit(run_id: UUID, container: ContainerDep, principal: AuditorDep) -> dict[str, Any]:
     """End-to-end audit trail of the run, assembled from stored records."""
     audit = RunAuditService(container.repositories).build(run_id=run_id)
     if audit is None:
@@ -439,33 +379,18 @@ def get_run_audit(run_id: UUID, container: ContainerDep) -> dict[str, Any]:
     return audit
 
 
-@router.post("/{run_id}/handoff")
+@router.post("/{run_id}/handoff", response_model=WorkflowResponse)
 def create_manual_handoff(
     run_id: UUID,
     payload: ManualHandoffRequest,
     container: ContainerDep,
-) -> dict:
-    run = container.repositories.runs.get_by_id(run_id=run_id)
-    if not run:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found.")
-
-    case = container.handoff_service.create_case(
-        run_id=run_id,
-        reason=payload.reason,
-        original_request="Manual operator escalation",
-    )
-    if payload.operator_id:
-        case = container.handoff_service.assign_case(
-            handoff_id=case.handoff_id, assigned_to=payload.operator_id
+    principal: EscalatorDep,
+) -> WorkflowResponse:
+    """Escalate to a human operator: everything pending on the run is superseded first."""
+    try:
+        result = container.orchestrator.escalate(
+            run_id=run_id, reason=payload.reason, actor=principal
         )
-
-    run.status = VoiceRunStatus.HANDOFF
-    container.repositories.runs.save(run=run)
-
-    return {
-        "handoff_id": str(case.handoff_id),
-        "run_id": str(case.run_id),
-        "status": case.status.value,
-        "priority": case.priority.value,
-        "reason": case.reason,
-    }
+    except ApprovalFlowError as error:
+        raise _approval_http_error(error) from error
+    return _to_response(result)

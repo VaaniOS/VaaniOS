@@ -4,6 +4,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from vaaniflow.domain.models.approval import Approval, ApprovalStatus
+from vaaniflow.domain.models.principal import Principal
 from vaaniflow.domain.models.tool_execution import (
     ToolExecution,
     ToolExecutionStatus,
@@ -495,7 +496,7 @@ class ExecutionService:
         reason: str,
         expected_state: dict[str, Any],
         entity_id: UUID | None = None,
-        resolved_by: UUID | None = None,
+        actor: Principal | None = None,
         now: datetime | None = None,
     ) -> ExecutionOutcome:
         """
@@ -546,7 +547,8 @@ class ExecutionService:
             "prior_status": execution.status,
             "prior_error_code": execution.error_code,
             "prior_error_message": execution.error_message,
-            "resolved_by": resolved_by,
+            "resolved_by": actor.principal_id if actor else None,
+            "resolved_actor": actor,
             "resolved_at": current_time,
             "resolution_reason": reason,
             "completed_at": current_time,

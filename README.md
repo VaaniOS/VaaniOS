@@ -26,7 +26,7 @@ messages.
 | **ACT**: business context, validation, risk/policy, planning | ✅ Implemented (synthetic data) |
 | Confirmation, approval, idempotent execution, UNKNOWN handling | ✅ Implemented |
 | Read-back verification, audit trail, traces, evaluation sandbox | ✅ Implemented |
-| HTTP API (FastAPI) with role-based authentication | ✅ Implemented (only on the routes that authorize something, see [Route authentication boundary](#route-authentication-boundary)) |
+| HTTP API (FastAPI) with bearer-token authentication and role-based permissions | ✅ Implemented on every run route; search and sandbox routes are open (see [Route authentication boundary](#route-authentication-boundary)) |
 | Production integrations: ERP, WhatsApp, telephony, TTS, persistent storage, identity provider | 🔜 Future |
 
 The Python package is called `vaaniflow` (the project's working name in the design
@@ -200,9 +200,10 @@ not assume one rate for every cement transaction.
 
 ### 3. When reality doesn't line up, nothing executes silently
 
-Each row is an evaluation-sandbox scenario (A–P) run through the production
-orchestrator and judged from the resulting repository state
-([`evaluation/scenarios.py`](apps/api/src/vaaniflow/evaluation/scenarios.py)):
+Each row is covered by an evaluation-sandbox scenario (A–J,
+[`evaluation/scenarios.py`](apps/api/src/vaaniflow/evaluation/scenarios.py)) or an
+integration test; both run through the production orchestrator and judge the outcome
+from the resulting repository state:
 
 | Situation | Outcome |
 |---|---|
@@ -223,27 +224,34 @@ orchestrator and judged from the resulting repository state
 ### Run it yourself
 
 ```bash
-# Start the API with the synthetic business clock and one demo OWNER token
+# Start the API with the synthetic business clock, a demo REQUESTER and a demo OWNER
 export VAANIFLOW_BUSINESS_CLOCK=synthetic
-export VAANIFLOW_API_TOKENS='{"demo-owner-token-0001": {"actor_id": "11111111-1111-4111-8111-111111111111", "name": "Ramesh", "roles": ["OWNER"]}}'
+export VAANIFLOW_API_TOKENS='{
+  "demo-requester-token-01": {"actor_id": "22222222-2222-4222-8222-222222222222", "name": "Suresh", "roles": ["REQUESTER"]},
+  "demo-owner-token-0001": {"actor_id": "11111111-1111-4111-8111-111111111111", "name": "Ramesh", "roles": ["OWNER"]}
+}'
 uvicorn vaaniflow.api.app:app
 
 # In a second terminal: every sandbox scenario, scored from actual state
 curl -s -X POST localhost:8000/sandbox/evaluate-all
 curl -s -X POST localhost:8000/sandbox/scenarios/scenario_c/run   # ambiguous customer
 
-# The canonical note, end to end
-RUN=$(curl -s -X POST localhost:8000/runs | jq -r .run_id)
-curl -s -X POST localhost:8000/runs/$RUN/process -H 'Content-Type: application/json' \
+# The canonical note, end to end: Suresh submits it, Ramesh approves it
+REQ='Authorization: Bearer demo-requester-token-01'
+OWN='Authorization: Bearer demo-owner-token-0001'
+RUN=$(curl -s -X POST localhost:8000/runs -H "$REQ" | jq -r .run_id)
+curl -s -X POST localhost:8000/runs/$RUN/process -H "$REQ" -H 'Content-Type: application/json' \
   -d '{"text": "Arre Suresh, Sharma Builders ko turant 200 bag Ultratech cement dispatch karo. Rate wahi lagana jo parso bataya tha—chaar sau bees rupaye per bag plus GST. Invoice bana ke mujhe WhatsApp pe approve karne bhej do."}'
-# → status APPROVAL_REQUIRED, with an approval_id. Without a token, /approve answers 401.
-curl -s -X POST localhost:8000/runs/$RUN/approve -H 'Content-Type: application/json' \
-  -H 'Authorization: Bearer demo-owner-token-0001' -d '{"approval_id": "<approval_id>"}'
-curl -s localhost:8000/runs/$RUN/audit -H 'Authorization: Bearer demo-owner-token-0001'
+# → status APPROVAL_REQUIRED, with an approval_id. Without a token /approve answers 401;
+#   with the REQUESTER token it answers 403 (only an OWNER approves).
+curl -s -X POST localhost:8000/runs/$RUN/approve -H "$OWN" -H 'Content-Type: application/json' \
+  -d '{"approval_id": "<approval_id>"}'
+curl -s localhost:8000/runs/$RUN/audit -H "$OWN"
 ```
 
-The token above is a local demo value; never reuse it outside a sandbox. Interactive API
-docs are served at `http://localhost:8000/docs`. Without `VAANIFLOW_BUSINESS_CLOCK=synthetic`
+The tokens above are local demo values; never reuse them outside a sandbox. Interactive
+API docs are served at `http://localhost:8000/docs`; Swagger's UI does not send the bearer
+token, so use curl (or another HTTP client) for the protected routes. Without `VAANIFLOW_BUSINESS_CLOCK=synthetic`
 the API uses the real clock, and the synthetic quotes may not match "parso".
 
 ---
@@ -367,15 +375,15 @@ integration layer:
 | Future integration work | Today |
 |---|---|
 | Production identity provider | Static bearer tokens from an environment variable |
-| Persistent storage | In-memory repositories behind the `RepositoryBundle` port |
+| Persistent storage | In-memory repositories (`SyntheticRepositories`) |
 | Production business systems (ERP, inventory, invoicing) | Synthetic dataset (`infrastructure/repositories/synthetic_data.py`) |
 | WhatsApp / telephony intake and notifications | Text through the HTTP API, audio through the Python services; notifications are reported as not performed |
 | Operator dashboard | HTTP API plus audit and trace endpoints |
 | Spoken responses (TTS) | Text messages only |
 
 Some limitations are part of the current design, not only missing connectors: one line
-item per request, no catalogue pricing, unauthenticated instruction and read routes,
-and no per-run ownership. See [Known limitations](#known-limitations) and
+item per request, no catalogue pricing, open search and sandbox routes, and a wide-open
+CORS policy. See [Known limitations](#known-limitations) and
 [Route authentication boundary](#route-authentication-boundary).
 
 ---
@@ -533,9 +541,9 @@ pytest -q
 | Variable | Purpose | Default | Example |
 |---|---|---|---|
 | `GNANI_API_KEY` | API key read by `gnani.stt.GnaniSTTClient` when no key is passed to its constructor | none (only live Gnani calls need it) | `GNANI_API_KEY=<your-gnani-api-key>` |
-| `VAANIFLOW_API_TOKENS` | Bearer tokens → principals for the API (see [ACT safety semantics](#act-safety-semantics)). JSON map; tokens ≥ 16 characters; roles `OWNER`, `REQUESTER`, `OPERATOR`, `AUDITOR`. A malformed value fails at startup | **unset → every protected route answers 401** | `{"<token>": {"actor_id": "<uuid>", "name": "Ramesh", "roles": ["OWNER"]}}` |
-| `VAANIFLOW_CORS_ORIGINS` | Comma-separated exact origins allowed by CORS | `http://localhost:3000,http://127.0.0.1:3000` | `https://dashboard.example.com` |
-| `VAANIFLOW_CORS_ALLOW_CREDENTIALS` | Allow credentialed CORS (`true`/`false`); refused together with a `*` origin | `false` | `false` |
+| `VAANIFLOW_API_TOKENS` | Bearer tokens → principals for the API (see [Route authentication boundary](#route-authentication-boundary)). JSON map; tokens ≥ 16 characters; roles `OWNER`, `REQUESTER`, `OPERATOR`, `AUDITOR`. A malformed value fails when the app container is first created (the first request), not at import | **unset → every protected route answers 401** | `{"<token>": {"actor_id": "<uuid>", "name": "Ramesh", "roles": ["OWNER"]}}` |
+| `TELEGRAM_BOT_TOKEN` | Telegram bot token for the demo adapter; environment only, never logged | none (the bot does not start) | `<your bot token>` |
+| `TELEGRAM_PRINCIPALS` | Telegram allowlist: numeric user id → principal, same shape as `VAANIFLOW_API_TOKENS` (see [Telegram adapter (demo)](#telegram-adapter-demo)) | **unset → every Telegram user is refused** | `{"<telegram user id>": {"actor_id": "<uuid>", "name": "Demo Owner", "roles": ["OWNER"]}}` |
 | `VAANIFLOW_BUSINESS_CLOCK` | Business clock: unset = real time; `synthetic` = the synthetic dataset's 2026-10-17 12:00 IST; or a timezone-aware ISO-8601 instant. Invalid values fail, never fall back | real clock | `synthetic` |
 
 ```bash
@@ -703,7 +711,7 @@ so the suite needs no credentials or network.
 pytest -q
 ```
 
-At the time of writing the suite collects and passes **583 tests**. No test needs
+At the time of writing the suite collects and passes **575 tests**. No test needs
 credentials or network access.
 
 What they prove, with exact-value assertions and checks on repository state rather than
@@ -712,22 +720,25 @@ on messages:
 - **Semantic safety**: negation, ambiguity (customer, product, quantity, price),
   numeric fidelity ("2000" stays 2000), corrections, temporal references
 - **Approval**: binding to run, plan and snapshot; stale and superseded approvals;
-  authenticated approvers only
+  authenticated OWNER approvers only
+- **Authentication**: configured tokens only; no header, token-format or body
+  impersonation; run ownership; escalated and closed runs cannot be reopened
 - **Pricing**: quote validity, the temporal quote match for "parso", spoken price as a
   claim, no fallback quote
 - **Execution**: idempotency, `UNKNOWN` outcomes and reconciliation, partial execution,
   read-back verification, duplicate order detection
 - **Workflow**: confirmation, clarification, operator resolution, escalation, the audit
   trail, ACT orchestration and the HTTP API
-- **Sandbox**: scenarios A–P through the production orchestrator
+- **Sandbox**: scenarios A–J through the production orchestrator
 
 | Category | Location | What it covers |
 |---|---|---|
 | Unit | `apps/api/tests/unit/` | Storage, preprocessing and quality analysis, ASR adapters, tokenizer and number words, compiler, references, corrections, temporal parsing, ambiguity, input evaluation |
 | Contract | `apps/api/tests/contracts/` | `SemanticState` and `UnderstandResult` invariants, JSON round-trips, absence of business identifiers, existing ACT-side domain contracts |
 | Integration | `apps/api/tests/integration/` | End-to-end UNDERSTAND pipeline with real local storage and WAV preprocessing, mock ASR and a fake Gnani client; ACT orchestration and HTTP API |
+| Authentication | `apps/api/tests/integration/test_auth_foundation.py`, `test_p3_authentication.py` | Token map, 401/403 on every run route, header/token-format/body impersonation, OWNER-only approval, recorded actors, run ownership, escalated/closed runs |
 | ACT safety regressions | `apps/api/tests/integration/test_act_safety.py`, `test_api_approval.py`, `test_p1_*.py`, `test_p2_hardening.py` | Actionability and negation gates, approval binding and supersession, temporal quote matching, quote validity, pricing authority, UNKNOWN outcomes and reconciliation, partial execution, verification, duplicate orders, confirmation, operator resolution, audit trail — asserting repository state |
-| ACT unit | `apps/api/tests/unit/{context,validation,policy,execution,handoff,evaluation,traces,infrastructure}/` | Resolvers, validation engine, policy matrix, tools, verifier, approvals, handoff, sandbox scenarios A–P |
+| ACT unit | `apps/api/tests/unit/{context,validation,policy,execution,handoff,evaluation,traces,infrastructure}/` | Resolvers, validation engine, policy matrix, tools, verifier, approvals, handoff, sandbox scenarios A–J |
 | Safety regressions | `apps/api/tests/unit/semantic/test_safety_regressions.py` | Negation, product/customer/quantity/price alternatives, numeric fidelity, fallback products |
 
 Useful subsets:
@@ -795,7 +806,7 @@ VaaniOS/
         │   ├── execution/         # plans, tools, idempotent execution, verifier,
         │   │                      # approvals, duplicate detection
         │   ├── handoff/ traces/   # structured human handoff, run traces
-        │   ├── evaluation/        # failure-injection sandbox (scenarios A–P)
+        │   ├── evaluation/        # failure-injection sandbox (scenarios A–J)
         │   ├── api/               # FastAPI app and routers
         │   └── config/
         └── tests/
@@ -864,10 +875,9 @@ Over synthetic, in-memory business data (`infrastructure/repositories/synthetic_
 - Execution with idempotency keys, read-back verification of every write, UNKNOWN handling
 - Structured human handoff, bound confirmation, operator resolution of UNKNOWN outcomes
 - Business-level duplicate order detection
-- Traces, an end-to-end audit endpoint, and a failure-injection sandbox (scenarios A–P)
-- Bearer-token authentication with role-based permissions on the approve, reject,
-  confirm, resolve, escalate and audit routes (instruction, read, search and sandbox
-  routes are not yet authenticated — see [Route authentication boundary](#route-authentication-boundary))
+- Traces, an end-to-end audit endpoint, and a failure-injection sandbox (scenarios A–J)
+- Bearer-token authentication with role-based permissions and run ownership on every run
+  route (search and sandbox routes are open — see [Route authentication boundary](#route-authentication-boundary))
 - FastAPI HTTP API (`apps/api/src/vaaniflow/api/`)
 
 ### ACT safety semantics
@@ -880,46 +890,95 @@ Over synthetic, in-memory business data (`infrastructure/repositories/synthetic_
 | Confirmation | A CONFIRM decision creates a confirmation bound to one run, the exact warnings asked about and the business snapshot. A yes/no reply (`POST /runs/{id}/confirm`) answers only that confirmation; if the facts changed it expires. Confirmation never executes — approval is still required. |
 | Duplicate orders | An open equivalent order (same customer, items, price, destination) blocks a new one; a completed one blocks only on the same business day. Orders the system creates stay `DRAFT` unless dispatched, so an identical undispatched request stays blocked until that order is handled. If orders cannot be read, nothing is created (handoff). |
 | Verification | Every planned write has a read-back contract (`execution/plan.py: VERIFICATION_CONTRACTS`); a tool without one is never planned. Only a verified step is reported as done. |
-| UNKNOWN outcomes | A timeout or exception after a write may have committed: the step is `UNKNOWN`, reconciled by read-back by idempotency key, never blindly retried. An operator can resolve it (`POST /runs/{id}/executions/{execution_id}/resolve`); success requires a verified record committed by that exact operation. History (`prior_*`, `resolution`) is never erased. Repeating the same resolution is an idempotent no-op; a different one is refused (`CONFLICTING_RESOLUTION`). Resolution never runs the remaining steps and never closes the handoff. The audit's `reconciliation` section reports any mismatch between a recorded outcome and business state (`FAILED_BUT_RECORD_EXISTS`, `SUCCEEDED_BUT_RECORD_MISSING`, `UNKNOWN_BUT_RECORD_EXISTS`). |
-| Idempotency | Every planned write has a key `run-<run>:plan-<plan>:<tool>`. Repeating the same call returns the stored outcome; a key reused by a different tool or different arguments is refused (`IDEMPOTENCY_KEY_CONFLICT`) and nothing runs. A FAILED call is never re-invoked under its key; an UNKNOWN one only after read-back proves nothing was committed. Repeated `/approve` or `/confirm` requests return 409 and repeat nothing. |
+| UNKNOWN outcomes | A timeout or exception after a write may have committed: the step is `UNKNOWN`, reconciled by read-back by idempotency key, never blindly retried. An operator can resolve it (`POST /runs/{id}/executions/{execution_id}/resolve`); success requires a verified record committed by that exact operation. History (`prior_*`, `resolution`) is never erased. Resolution requires an `OPERATOR`, never runs the remaining steps and never closes the handoff. The audit's `reconciliation` section reports a FAILED outcome whose record nevertheless exists (`FAILED_BUT_RECORD_EXISTS`). |
+| Idempotency | Every planned write has a key `run-<run>:plan-<plan>:<tool>`. Repeating the same call returns the stored outcome. A FAILED call is never re-invoked under its key; an UNKNOWN one only after read-back proves nothing was committed. Repeated `/approve` or `/confirm` requests return 409 and repeat nothing. |
 | Partial execution | Each step reports VERIFIED / FAILED / UNKNOWN / NOT_ATTEMPTED; runs end `COMPLETED`, `PARTIALLY_COMPLETED`, `FAILED` or `HANDOFF`. Nothing is rolled back and no rollback is claimed. Messages state record statuses (a DRAFT order reads as DRAFT). |
-| Authentication | `Authorization: Bearer <token>`, tokens from `VAANIFLOW_API_TOKENS`. Permissions: approve/reject → `OWNER`; confirm → `REQUESTER` or `OWNER`; resolve UNKNOWN and escalate (`/handoff`) → `OPERATOR`; read `/audit` → `AUDITOR`, `OPERATOR` or `OWNER`. No body field can name an actor (422). Every decision on a run, granted or denied, is in its audit `access` log. The orchestrator re-checks the permission itself. Instruction, read, search and sandbox routes are **not** authenticated (see below). |
-| CORS | Explicit origins only (default: local dashboard on port 3000); credentials off; a wildcard origin with credentials is refused at startup. |
-| Persistence | All state is in-memory (`SyntheticRepositories`) and lost on restart. ACT code depends only on the `RepositoryBundle` port (`application/ports/repositories.py`), so a persistent store can replace it. |
+| Authentication | `Authorization: Bearer <token>`, tokens from `VAANIFLOW_API_TOKENS` (ADR-022). Identity and roles come only from the configured token; `X-Role`, `X-User-Id`, `X-Principal-Id` and role-named or bare-UUID tokens have no effect, and no body field can name an actor (422). Approve/reject, confirm, UNKNOWN resolution and escalation are re-checked by the orchestrator. See [Route authentication boundary](#route-authentication-boundary). |
+| CORS | **Not restricted**: any origin (`*`) with credentials allowed (`api/app.py`). Bearer tokens are not sent automatically by browsers, but the policy must be narrowed before any deployment. |
+| Persistence | All state is in-memory (`SyntheticRepositories`) and lost on restart. |
 | Business clock | Production uses the real clock. `VAANIFLOW_BUSINESS_CLOCK=synthetic` (or an ISO-8601 instant) pins the API to the synthetic dataset's 2026-10-17 12:00 IST for demos; the evaluation runner always uses it. |
 
 ### Route authentication boundary
 
-Current behaviour, not a target state. Authorization is a global role check: runs are
-not bound to the principal who created them, so any `REQUESTER` can confirm any run and
-any `AUDITOR` can read any run's audit.
+Identity comes only from a configured bearer token (ADR-022). Runs are owned by the
+principal that created them.
 
-| Class | Routes | Authentication |
-|---|---|---|
-| Protected | `POST /runs/{id}/approve`, `/reject` (`OWNER`); `/confirm` (`REQUESTER`/`OWNER`); `/executions/{execution_id}/resolve`, `/handoff` (`OPERATOR`); `GET /runs/{id}/audit` (`AUDITOR`/`OPERATOR`/`OWNER`) | Bearer token + permission, re-checked by the orchestrator |
-| Unauthenticated — instructions | `POST /runs` (with `text`), `POST /runs/{id}/process`, `POST /runs/{id}/clarify` | None |
-| Unauthenticated — reads | `GET /runs/{id}`, `GET /runs/{id}/trace`, `GET /runs/{id}/validation`, `GET /customers/search`, `/products/search`, `/quotes/search`, `/inventory/search` | None |
-| Sandbox / demo only | `GET /sandbox/scenarios`, `POST /sandbox/scenarios/{id}/run`, `POST /sandbox/evaluate-all` | None; scenarios run as the synthetic evaluation actor on fresh, isolated repositories |
+| Route | Who may call it |
+|---|---|
+| `POST /runs` | `SUBMIT_INSTRUCTION` (`REQUESTER`, `OWNER`, `OPERATOR`); the caller becomes the run owner |
+| `POST /runs/{id}/process`, `/clarify` | `SUBMIT_INSTRUCTION` and the run owner (an `OPERATOR` may re-instruct any run). Refused with 409 on an escalated (`HANDOFF`) or settled (`EXECUTING`, `COMPLETED`, `PARTIALLY_COMPLETED`, `FAILED`, `BLOCKED`) run |
+| `POST /runs/{id}/approve`, `/reject` | `OWNER` only (the owner approves runs requested by others) |
+| `POST /runs/{id}/confirm` | `REQUESTER` for their own run, or `OWNER` |
+| `POST /runs/{id}/executions/{execution_id}/resolve` | `OPERATOR` |
+| `POST /runs/{id}/handoff` | `OPERATOR`; supersedes everything pending on the run and assigns the case to that operator |
+| `GET /runs/{id}`, `/trace`, `/validation` | The run owner, or `AUDITOR` / `OPERATOR` / `OWNER` |
+| `GET /runs/{id}/audit` | `AUDITOR`, `OPERATOR` or `OWNER` |
+| `GET /customers/search`, `/products/search`, `/quotes/search`, `/inventory/search` | **Open** (synthetic business data) |
+| `GET /sandbox/scenarios`, `POST /sandbox/scenarios/{id}/run`, `POST /sandbox/evaluate-all` | **Open**, demo only: scenarios run with the labelled synthetic evaluation actor (`SYNTHETIC_EVALUATION_OWNER`, `synthetic = true`) on fresh repositories isolated from the API's runs and records |
 
-**Known security limitations (pending P3 hardening):**
+Missing credentials → 401 `AUTHENTICATION_REQUIRED`; an unknown token → 401
+`INVALID_CREDENTIALS`; a missing permission or another principal's run → 403. Approvals,
+confirmations and UNKNOWN resolutions record the acting principal (`approved_actor`,
+`rejected_actor`, `confirmed_actor`, `resolved_actor`); `actor_authenticated` is true only
+for a credential-authenticated approver or rejecter.
 
-- **Instruction injection into an existing run.** The unauthenticated instruction routes
-  never execute anything by themselves — every write still needs an authenticated
-  `OWNER` to approve a specific approval. But an unauthenticated caller can send a new
-  instruction to any existing run: this supersedes the pending approval (the owner's
-  approval of it is then refused with 409) and creates a new plan and approval from the
-  caller's text, which an owner approving the run's current approval would execute. The
-  same call reopens a run that was escalated to a human (the handoff stays assigned) or
-  that already completed. History is preserved in the audit.
-- **Unauthenticated reads.** `/trace` contains the transcript and most of what
-  `/audit` protects; `GET /runs/{id}` and `/validation` expose run status and
-  validation results; the search routes expose (synthetic) customer, product, quote and
-  inventory data.
-- **Sandbox over HTTP.** The `/sandbox/*` routes are callable without a token and run
-  through the production orchestrator with the synthetic evaluation actor
-  (`SYNTHETIC_EVALUATION_OWNER`, `synthetic = true`) confirming and approving. They use
-  fresh repositories, so they cannot read or change the API's runs or business records.
-  They must not be exposed outside a demo environment.
+**Known limitations:**
+
+- **Static tokens**: no expiry, rotation, rate limiting or user management.
+- **Open routes**: the search routes expose (synthetic) business data; the sandbox routes
+  must not be exposed outside a demo environment.
+- **CORS** allows any origin (see [ACT safety semantics](#act-safety-semantics)).
+- **Telegram adapter**: see [Telegram adapter (demo)](#telegram-adapter-demo).
+
+### Telegram adapter (demo)
+
+`presentation/telegram_bot.py` is a demo adapter. It uses the same principals and the
+same authorization rules as the HTTP API:
+
+```text
+Telegram user id ──► TELEGRAM_PRINCIPALS allowlist ──► Principal (actor id, roles,
+"telegram-allowlist") ──► permissions, run ownership, run state ──► orchestrator
+```
+
+- **Identity**: only an allowlisted numeric Telegram user id becomes a principal. Unknown
+  users are refused (the bot replies with their user id so the operator can add it) and
+  nothing is created. Usernames, display names, chat ids and button data never
+  contribute identity or roles. An unset `TELEGRAM_PRINCIPALS` refuses everyone; a
+  malformed one stops the bot at startup.
+- **Chats**: private chats only. Group chats, and updates whose sender is not the chat,
+  are refused.
+- **Ownership**: a run started from Telegram is owned by the user's principal. Each user's
+  messages only ever continue their own open run; a settled or escalated run is never
+  reopened (the next message starts a new run). Clarify is refused for another user's run.
+- **Approval / rejection**: only an allowlisted `OWNER` (checked by the orchestrator, not
+  by hiding buttons). Approvals record `approved_actor` / `rejected_actor` with
+  `authentication_method = "telegram-allowlist"`. A stale button (approved, rejected,
+  expired, superseded, escalated, from before a restart, or for another run) changes
+  nothing.
+- **Confirmation**: Yes/No buttons on a confirmation; only the requester of that run (or
+  an `OWNER`) may answer.
+- **Buttons**: `callback_data` is untrusted input, parsed against a fixed grammar with
+  compact ids (within Telegram's 64-byte limit); anything else is refused without
+  reaching business logic. A failing update is logged and reported; it never stops
+  polling.
+- **Secrets**: `TELEGRAM_BOT_TOKEN` is read from the environment only. Telegram API
+  errors are re-raised without the request URL, and the token is redacted from the
+  adapter's and httpx's log records.
+
+Run it locally (synthetic identities only; never commit real ids or tokens):
+
+```bash
+export TELEGRAM_BOT_TOKEN='<your bot token>'
+export TELEGRAM_PRINCIPALS='{"<your numeric Telegram user id>": {"actor_id": "00000000-0000-4000-8000-00000000d001", "name": "Demo Owner", "roles": ["OWNER", "REQUESTER"]}}'
+python -m vaaniflow.presentation.telegram_bot
+```
+
+Message the bot once without `TELEGRAM_PRINCIPALS` to learn your user id.
+
+Not implemented yet: voice notes are **not transcribed** (the bot uses the caption, or the
+canonical demo text); approval and execution messages are partly fixed text; state
+(runs, active-run per user) is in memory and lost on restart; the bot keeps its own
+in-memory repositories, separate from the HTTP API's.
 
 ### Next (not implemented)
 
@@ -985,10 +1044,9 @@ any `AUDITOR` can read any run's audit.
   the open clarification record (what was understood, what is missing) is preserved and
   superseded, but partial answers are not merged into the earlier request.
 - **Sandbox authentication**: static bearer tokens from an environment variable, no
-  expiry, rotation, rate limiting or user management. The boundary (who may approve,
-  confirm, resolve, escalate, audit) is enforced; the credential store is not
-  production-grade. Instruction, read, search and sandbox routes are not authenticated,
-  and runs are not owner-isolated (see [Route authentication boundary](#route-authentication-boundary)).
+  expiry, rotation, rate limiting or user management. The permission and run-ownership
+  boundary is enforced; the credential store is not production-grade. Search and sandbox
+  routes are open and CORS is unrestricted (see [Route authentication boundary](#route-authentication-boundary)).
 - **Not production-ready**: in-memory state, synthetic data, sandbox authentication.
 - **Relative dates**: only day offsets (kal/parso/…) are resolved; a spoken weekday or
   explicit date linked to a rate is treated as unresolved (clarification).
@@ -1011,7 +1069,7 @@ any `AUDITOR` can read any run's audit.
 | [08 · Validation, policy, risk](System-Design/08-validation-policy-risk.md) | ACT: deterministic safeguards |
 | [09 · Execution & verification](System-Design/09-execution-verification.md) | ACT: approval, idempotency, read-back |
 | [16 · Development plan](System-Design/16-development-plan.md) | UNDERSTAND / ACT team split |
-| [18 · Architecture decisions](System-Design/18-architecture-decisions.md) | ADR-001 … ADR-022 |
+| [18 · Architecture decisions](System-Design/18-architecture-decisions.md) | ADR-001 … ADR-022 (ADR-022: authentication) |
 | [20 · Gnani integration](System-Design/20-gnani-integration.md) | Provider adapter strategy |
 | [docs/architecture/understand-handoff.md](docs/architecture/understand-handoff.md) | UNDERSTAND → ACT handoff contract and consumer rules |
 

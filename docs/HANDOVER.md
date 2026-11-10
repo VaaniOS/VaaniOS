@@ -70,7 +70,7 @@ All source paths below are relative to the repository root.
 | **Boundary** | Implementation stops at `UnderstandResult` (`apps/api/src/vaaniflow/domain/schemas/understand.py`) |
 | **Done (Arjun)** | Audio ingestion and preprocessing, Gnani STT adapter, transcript contract, semantic compiler (entities, items, pricing, references, corrections, temporal, ambiguity, negation), input evaluation, `UnderstandResult`, end-to-end Understand services, 296 tests, docs |
 | **ACT (since handover)** | Implemented: context resolution, validation, risk/policy, planning, approval, execution, verification, handoff, sandbox, traces, HTTP API — then hardened in three audited phases (P0 safety `2ac8390`, P1 correctness `ff28e0c`, P2 production hardening) |
-| **Remaining (shared)** | Dashboard, integration, persistence, authentication, demo polish |
+| **Remaining (shared)** | Dashboard, integration, persistence, production identity provider, demo polish |
 
 The rows above describe the state at handover. The ACT sections below (§14–§23)
 remain the design brief; the current implementation is summarised next.
@@ -88,7 +88,9 @@ ACT runs over synthetic in-memory data. Its safety semantics:
 - **Approval** is bound to run, plan fingerprint and business snapshot, re-validated at
   execution, superseded by any new instruction on the run, and fully audited (run, plan,
   snapshot, actors, timestamps, rejection/expiry reasons, `superseded_by`, produced
-  records). Identities are claims (`actor_authenticated = false`); they never authorize.
+  records). Actors are authenticated principals (ADR-022): bearer tokens from
+  `VAANIFLOW_API_TOKENS`, role-based permissions, run ownership; no body or header
+  identity is accepted.
 - **Confirmation** (`POST /runs/{id}/confirm`) answers one pending confirmation of one
   run, bound to its warnings and snapshot; it never executes (approval still required).
 - **Duplicate orders**: an open equivalent order blocks a new one; a completed one
@@ -1084,9 +1086,9 @@ Safety invariants that must never break (CLAUDE.md §2, 23 §23.6, 24):
 | KNOWN LIMITATION | One line item per request; multi-item requests are clarified |
 | KNOWN LIMITATION | No catalog/operator pricing: no applicable quote → no voice sale (ADR-019); `ACCEPTED` quotes not executable (semantics undefined) |
 | KNOWN LIMITATION | `/clarify` takes a full new instruction; partial answers are not merged into the earlier request (the clarification record is preserved) |
-| KNOWN LIMITATION | No authentication: approver/rejector/confirmer/resolver identities are recorded claims |
+| KNOWN LIMITATION | Sandbox authentication only (ADR-022): static bearer tokens, no expiry/rotation; search and sandbox routes are open; the Telegram demo adapter authenticates only allowlisted user ids (`TELEGRAM_PRINCIPALS`), private chats only; its voice notes are not transcribed yet |
 | KNOWN LIMITATION | Only day-offset relative dates resolve; weekday/explicit dates linked to a rate → clarification |
-| FUTURE FEATURE | Dashboard, TTS, persistence, authentication/authorization |
+| FUTURE FEATURE | Dashboard, TTS, persistence, production identity provider |
 
 ---
 

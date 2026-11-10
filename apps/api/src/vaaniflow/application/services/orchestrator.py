@@ -20,6 +20,13 @@ from vaaniflow.domain.models.followup import (
     PendingConfirmation,
 )
 from vaaniflow.domain.models.handoff import HandoffCase
+from vaaniflow.domain.models.principal import (
+    AuthorizationError,
+    Permission,
+    Principal,
+    Role,
+    require_permission,
+)
 from vaaniflow.domain.models.tool_execution import ToolExecutionStatus
 from vaaniflow.domain.models.validation import ValidationResult, ValidationStatus
 from vaaniflow.domain.models.verification import VerificationStatus
@@ -487,7 +494,6 @@ class VoiceWorkflowOrchestrator:
             plan_id=plan.plan_id,
             plan_fingerprint=plan.fingerprint,
             requested_by=run.owner_id,
-            actor_authenticated=run.owner_id is not None,
             now=t,
         )
         self.repositories.pending_executions.save(
@@ -558,18 +564,21 @@ class VoiceWorkflowOrchestrator:
         *,
         run_id: UUID,
         approval_id: UUID,
-        approved_by: UUID | None = None,
+        actor: Principal | None = None,
         simulated_faults: dict[str, Any] | None = None,
         now: datetime | None = None,
     ) -> WorkflowResult:
         """
         Approve a pending approval of this run and execute exactly its stored plan.
 
-        The stored plan is re-assessed against current business state first;
-        if the decision, the plan or the business snapshot changed, the
-        approval expires and nothing executes.
+        Requires a principal holding APPROVE (OWNER); the recorded approver is
+        that principal, never an identity from a request (ADR-022). The stored
+        plan is re-assessed against current business state first; if the
+        decision, the plan or the business snapshot changed, the approval
+        expires and nothing executes.
         """
         t = now or self.clock()
+        actor = self._authorize(actor, Permission.APPROVE)
         run, pending, approval = self._pending_approval(run_id=run_id, approval_id=approval_id)
         plan = pending.plan
         understand_result = pending.understand_result
@@ -656,7 +665,7 @@ class VoiceWorkflowOrchestrator:
         # The snapshot recomputed now (equal to the plan's, or it would have expired).
         approval = self.approval_service.approve(
             approval_id=approval.approval_id,
-            approved_by=approved_by,
+            actor=actor,
             current_snapshot_version=act.snapshot_version,
             now=t,
         )
@@ -698,15 +707,16 @@ class VoiceWorkflowOrchestrator:
         *,
         run_id: UUID,
         approval_id: UUID,
-        rejected_by: UUID | None = None,
+        actor: Principal | None = None,
         reason: str | None = None,
         now: datetime | None = None,
     ) -> WorkflowResult:
-        """Reject a pending approval of this run. Its plan can never execute."""
+        """Reject a pending approval of this run (APPROVE permission). Its plan never executes."""
         t = now or self.clock()
+        actor = self._authorize(actor, Permission.APPROVE)
         run, pending, approval = self._pending_approval(run_id=run_id, approval_id=approval_id)
         approval = self.approval_service.reject(
-            approval_id=approval.approval_id, rejected_by=rejected_by, reason=reason, now=t
+            approval_id=approval.approval_id, actor=actor, reason=reason, now=t
         )
         run.failure_code = "APPROVAL_REJECTED"
         run.failure_message = "The owner rejected the planned actions. Nothing was executed."
@@ -735,7 +745,7 @@ class VoiceWorkflowOrchestrator:
         run_id: UUID,
         reply: str,
         confirmation_id: UUID | None = None,
-        confirmed_by: UUID | None = None,
+        actor: Principal | None = None,
         now: datetime | None = None,
     ) -> WorkflowResult:
         """
@@ -745,11 +755,21 @@ class VoiceWorkflowOrchestrator:
         REQUESTED. "Yes" accepts exactly the warnings it was asked about, on the
         business snapshot it was asked with; if the facts changed it expires.
         Confirmation never executes anything: writes still need approval.
+        Requires CONFIRM; a REQUESTER may only answer for a run they own.
         """
         t = now or self.clock()
+        actor = self._authorize(actor, Permission.CONFIRM, error=ConfirmationFlowError)
         run = self.repositories.runs.get_by_id(run_id=run_id)
         if run is None:
             raise ConfirmationFlowError("RUN_NOT_FOUND", f"Run {run_id} not found.")
+        if (
+            run.owner_id is not None
+            and run.owner_id != actor.principal_id
+            and not actor.has_role(Role.OWNER)
+        ):
+            raise ConfirmationFlowError(
+                "FORBIDDEN", f"Run {run_id} belongs to another principal; only it may confirm."
+            )
         confirmation = self._pending_confirmation(run, confirmation_id)
         if confirmation is None:
             return WorkflowResult(
@@ -797,7 +817,8 @@ class VoiceWorkflowOrchestrator:
             return result
 
         confirmation.reply_text = reply
-        confirmation.confirmed_by = confirmed_by
+        confirmation.confirmed_by = actor.principal_id
+        confirmation.confirmed_actor = actor
         confirmation.resolved_at = t
         if intent is ReplyIntent.DECLINE:
             confirmation.status = ConfirmationStatus.DECLINED
@@ -1072,7 +1093,7 @@ class VoiceWorkflowOrchestrator:
         attempt: int,
         outcome: ToolExecutionStatus,
         reason: str,
-        resolved_by: UUID | None = None,
+        actor: Principal | None = None,
         entity_id: UUID | None = None,
         now: datetime | None = None,
     ) -> WorkflowResult:
@@ -1080,8 +1101,10 @@ class VoiceWorkflowOrchestrator:
         Record an operator's verified resolution of one UNKNOWN execution and
         recompute the run from the plan's step evidence. The UNKNOWN history is
         kept on the execution record; remaining steps are never run here.
+        Requires RESOLVE_UNKNOWN (OPERATOR).
         """
         t = now or self.clock()
+        actor = self._authorize(actor, Permission.RESOLVE_UNKNOWN, error=OperatorResolutionError)
         run = self.repositories.runs.get_by_id(run_id=run_id)
         if run is None:
             raise OperatorResolutionError("RUN_NOT_FOUND", f"Run {run_id} not found.")
@@ -1103,7 +1126,7 @@ class VoiceWorkflowOrchestrator:
             reason=reason,
             expected_state=expected_state,
             entity_id=entity_id,
-            resolved_by=resolved_by,
+            actor=actor,
             now=t,
         )
         self.trace_service.record_stage(
@@ -1223,7 +1246,91 @@ class VoiceWorkflowOrchestrator:
             )
         return steps
 
-    def _supersede_pending_approvals(self, run: VoiceRun, *, now: datetime) -> list[UUID]:
+    @staticmethod
+    def _authorize(
+        actor: Principal | None,
+        permission: Permission,
+        *,
+        error: type[Exception] = ApprovalFlowError,
+    ) -> Principal:
+        """The actor if it holds ``permission``; otherwise ``error`` with UNAUTHENTICATED/FORBIDDEN."""
+        try:
+            return require_permission(actor, permission)
+        except AuthorizationError as exc:
+            raise error(exc.code, exc.message) from exc  # type: ignore[call-arg]
+
+    def escalate(
+        self,
+        *,
+        run_id: UUID,
+        reason: str,
+        actor: Principal | None = None,
+        now: datetime | None = None,
+    ) -> WorkflowResult:
+        """
+        Manual escalation to a human operator (CREATE_HANDOFF permission).
+
+        Everything pending on the run is superseded first, so nothing requested
+        before the escalation can execute afterwards. The case is assigned to the
+        escalating operator and never claims that anything was completed.
+        """
+        t = now or self.clock()
+        actor = self._authorize(actor, Permission.CREATE_HANDOFF)
+        run = self.repositories.runs.get_by_id(run_id=run_id)
+        if run is None:
+            raise ApprovalFlowError("RUN_NOT_FOUND", f"Run {run_id} not found.")
+        cause = f"an operator escalation ({actor.display_name})"
+        superseded = self._supersede_pending_approvals(run, now=t, cause=cause)
+        superseded_confirmations = self._supersede_pending_confirmations(run, now=t)
+        self._supersede_open_clarifications(run, now=t)
+        instructions = self.repositories.understand_results.list_by_run(run_id=run.run_id)
+        latest = instructions[-1] if instructions else None
+        executions = self.repositories.tool_executions.list_by_run(run_id=run.run_id)
+        case = self.handoff_service.create_case(
+            run_id=run.run_id,
+            reason=reason,
+            original_request=latest.transcript.text
+            if latest
+            else "(no instruction was recorded on this run)",
+            interpreted_request=interpret_semantic_state(latest.semantic_state) if latest else {},
+            attempted_actions=[f"{e.tool_name}: {e.status.value}" for e in executions],
+            blocked_actions=[f"approval {a}" for a in superseded]
+            + [f"confirmation {c}" for c in superseded_confirmations],
+            recommended_action="Review the run audit trail before taking any business action.",
+            now=t,
+        )
+        case = self.handoff_service.assign_case(
+            handoff_id=case.handoff_id, assigned_to=actor.principal_id
+        )
+        run.failure_code = "MANUAL_ESCALATION"
+        run.failure_message = f"Escalated to a human operator: {reason}"
+        self._set_status(run, VoiceRunStatus.HANDOFF, t)
+        self.trace_service.record_stage(
+            run_id=run.run_id,
+            stage=TraceStage.HANDOFF_CREATED,
+            output_summary=(
+                f"Manual escalation by {actor.display_name}: handoff {case.handoff_id}; "
+                f"superseded approvals={len(superseded)}, "
+                f"confirmations={len(superseded_confirmations)}"
+            ),
+            timestamp=t,
+        )
+        result = self._result(
+            run,
+            latest,
+            handoff_case=case,
+            message=(
+                f"Escalated to a human operator (handoff {case.handoff_id}). Nothing pending "
+                "on this run can execute."
+            ),
+        )
+        result.superseded_approval_ids = superseded
+        result.superseded_confirmation_ids = superseded_confirmations
+        return result
+
+    def _supersede_pending_approvals(
+        self, run: VoiceRun, *, now: datetime, cause: str = "a new instruction on this run"
+    ) -> list[UUID]:
         superseded: list[UUID] = []
         for pending in self.repositories.pending_executions.list_by_run(run_id=run.run_id):
             approval = self.repositories.approvals.get_by_id(approval_id=pending.approval_id)
@@ -1236,7 +1343,7 @@ class VoiceWorkflowOrchestrator:
                 stage=TraceStage.APPROVAL_SUPERSEDED,
                 output_summary=(
                     f"Approval {approval.approval_id} (plan {pending.plan.plan_id}) superseded "
-                    "by a new instruction on this run; it can no longer execute."
+                    f"by {cause}; it can no longer execute."
                 ),
                 timestamp=now,
             )

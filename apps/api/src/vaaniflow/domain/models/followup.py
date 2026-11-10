@@ -14,6 +14,7 @@ from uuid import UUID
 
 from pydantic import Field
 
+from vaaniflow.domain.models.principal import Principal
 from vaaniflow.domain.schemas.common import DomainSchema
 from vaaniflow.domain.schemas.understand import UnderstandResult
 
@@ -41,7 +42,9 @@ class PendingConfirmation(DomainSchema):
     created_at: datetime
     resolved_at: datetime | None = None
     reply_text: str | None = None
+    # The authenticated principal that answered (ADR-022); never a body field.
     confirmed_by: UUID | None = None
+    confirmed_actor: Principal | None = None
     resolution_reason: str | None = None
     superseded_by: UUID | None = None
 

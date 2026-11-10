@@ -6,6 +6,7 @@ from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
+from tests.auth_support import auth, provider
 from vaaniflow.api.app import app
 from vaaniflow.api.dependencies import AppContainer, reset_container
 from vaaniflow.infrastructure.repositories.synthetic_data import SYNTHETIC_BUSINESS_TIME
@@ -16,12 +17,12 @@ KUMAR_DISPATCH = "Kumar Constructions ko 10 bags ACC cement ₹400 per bag dispa
 
 
 def _fresh() -> AppContainer:
-    return reset_container(clock=lambda: SYNTHETIC_BUSINESS_TIME)
+    return reset_container(clock=lambda: SYNTHETIC_BUSINESS_TIME, identity_provider=provider())
 
 
 def _process(text: str) -> tuple[str, dict]:  # type: ignore[type-arg]
-    run_id = client.post("/runs").json()["run_id"]
-    response = client.post(f"/runs/{run_id}/process", json={"text": text})
+    run_id = client.post("/runs", headers=auth()).json()["run_id"]
+    response = client.post(f"/runs/{run_id}/process", json={"text": text}, headers=auth())
     assert response.status_code == 200
     return run_id, response.json()
 
@@ -42,7 +43,7 @@ def test_approve_executes_the_stored_plan_not_a_hard_coded_order() -> None:
     assert processed["planned_tools"] == ["create_order", "dispatch_order"]
 
     response = client.post(
-        f"/runs/{run_id}/approve", json={"approval_id": processed["approval_id"]}
+        f"/runs/{run_id}/approve", json={"approval_id": processed["approval_id"]}, headers=auth()
     )
 
     assert response.status_code == 200
@@ -60,7 +61,7 @@ def test_approve_requires_an_approval_id() -> None:
     container = _fresh()
     run_id, _ = _process(KUMAR_DISPATCH)
 
-    response = client.post(f"/runs/{run_id}/approve", json={})
+    response = client.post(f"/runs/{run_id}/approve", json={}, headers=auth())
 
     assert response.status_code == 422
     assert _writes(container) == (0, 0, 0)
@@ -71,7 +72,9 @@ def test_approval_of_another_run_is_refused() -> None:
     _, run_a = _process(KUMAR_DISPATCH)
     run_b_id, _ = _process(KUMAR_DISPATCH)
 
-    response = client.post(f"/runs/{run_b_id}/approve", json={"approval_id": run_a["approval_id"]})
+    response = client.post(
+        f"/runs/{run_b_id}/approve", json={"approval_id": run_a["approval_id"]}, headers=auth()
+    )
 
     assert response.status_code == 409
     assert response.json()["detail"]["code"] == "APPROVAL_RUN_MISMATCH"
@@ -82,7 +85,9 @@ def test_unknown_approval_id_is_refused() -> None:
     container = _fresh()
     run_id, _ = _process(KUMAR_DISPATCH)
 
-    response = client.post(f"/runs/{run_id}/approve", json={"approval_id": str(uuid4())})
+    response = client.post(
+        f"/runs/{run_id}/approve", json={"approval_id": str(uuid4())}, headers=auth()
+    )
 
     assert response.status_code == 404
     assert _writes(container) == (0, 0, 0)
@@ -92,9 +97,11 @@ def test_rejected_approval_cannot_be_approved_later() -> None:
     container = _fresh()
     run_id, processed = _process(KUMAR_DISPATCH)
 
-    rejected = client.post(f"/runs/{run_id}/reject", json={"approval_id": processed["approval_id"]})
+    rejected = client.post(
+        f"/runs/{run_id}/reject", json={"approval_id": processed["approval_id"]}, headers=auth()
+    )
     approved = client.post(
-        f"/runs/{run_id}/approve", json={"approval_id": processed["approval_id"]}
+        f"/runs/{run_id}/approve", json={"approval_id": processed["approval_id"]}, headers=auth()
     )
 
     assert rejected.status_code == 200
@@ -106,10 +113,12 @@ def test_rejected_approval_cannot_be_approved_later() -> None:
 
 def test_client_cannot_self_approve_through_process() -> None:
     container = _fresh()
-    run_id = client.post("/runs").json()["run_id"]
+    run_id = client.post("/runs", headers=auth()).json()["run_id"]
 
     response = client.post(
-        f"/runs/{run_id}/process", json={"text": KUMAR_DISPATCH, "is_approved": True}
+        f"/runs/{run_id}/process",
+        json={"text": KUMAR_DISPATCH, "is_approved": True},
+        headers=auth(),
     )
 
     assert response.status_code == 422
@@ -118,11 +127,12 @@ def test_client_cannot_self_approve_through_process() -> None:
 
 def test_client_cannot_inject_faults_through_process() -> None:
     container = _fresh()
-    run_id = client.post("/runs").json()["run_id"]
+    run_id = client.post("/runs", headers=auth()).json()["run_id"]
 
     response = client.post(
         f"/runs/{run_id}/process",
         json={"text": KUMAR_DISPATCH, "faults": {"override_approval_snapshot": "x"}},
+        headers=auth(),
     )
 
     assert response.status_code == 422

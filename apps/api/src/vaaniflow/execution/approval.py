@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 from vaaniflow.domain.models.approval import Approval, ApprovalStatus
+from vaaniflow.domain.models.principal import Principal
 from vaaniflow.infrastructure.repositories.synthetic_data import SyntheticRepositories
 
 
@@ -27,7 +28,6 @@ class ApprovalService:
         plan_fingerprint: str | None = None,
         order_id: UUID | None = None,
         invoice_id: UUID | None = None,
-        actor_authenticated: bool = False,
         now: datetime | None = None,
     ) -> Approval:
         """Create a new approval request bound to its run, plan and business snapshot."""
@@ -40,7 +40,6 @@ class ApprovalService:
             order_id=order_id,
             invoice_id=invoice_id,
             requested_by=requested_by,
-            actor_authenticated=actor_authenticated,
             status=ApprovalStatus.REQUESTED,
             snapshot_version=snapshot_version,
             requested_at=current_time,
@@ -52,7 +51,7 @@ class ApprovalService:
         self,
         *,
         approval_id: UUID,
-        approved_by: UUID | None,
+        actor: Principal,
         current_snapshot_version: str,
         now: datetime | None = None,
     ) -> Approval:
@@ -77,7 +76,9 @@ class ApprovalService:
             return approval
 
         approval.status = ApprovalStatus.APPROVED
-        approval.approved_by = approved_by
+        approval.approved_by = actor.principal_id
+        approval.approved_actor = actor
+        approval.actor_authenticated = not actor.synthetic
         approval.resolved_at = current_time
         self._repositories.approvals.save(approval=approval)
         return approval
@@ -86,7 +87,7 @@ class ApprovalService:
         self,
         *,
         approval_id: UUID,
-        rejected_by: UUID | None,
+        actor: Principal,
         reason: str | None = None,
         now: datetime | None = None,
     ) -> Approval:
@@ -97,7 +98,9 @@ class ApprovalService:
 
         current_time = now or datetime.now(UTC)
         approval.status = ApprovalStatus.REJECTED
-        approval.rejected_by = rejected_by
+        approval.rejected_by = actor.principal_id
+        approval.rejected_actor = actor
+        approval.actor_authenticated = not actor.synthetic
         approval.rejection_reason = reason
         approval.resolved_at = current_time
         self._repositories.approvals.save(approval=approval)

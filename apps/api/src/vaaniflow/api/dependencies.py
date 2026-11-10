@@ -5,6 +5,7 @@ from typing import Annotated
 
 from fastapi import Depends
 
+from vaaniflow.api.auth import IdentityProvider, StaticTokenIdentityProvider
 from vaaniflow.application.services.orchestrator import VoiceWorkflowOrchestrator
 from vaaniflow.evaluation.runner import EvaluationRunner
 from vaaniflow.handoff.service import HandoffService
@@ -51,11 +52,19 @@ def business_clock_from_env(
 class AppContainer:
     """Singleton container of repository and service singletons for API lifespan."""
 
-    def __init__(self, clock: Callable[[], datetime] | None = None) -> None:
+    def __init__(
+        self,
+        clock: Callable[[], datetime] | None = None,
+        identity_provider: IdentityProvider | None = None,
+    ) -> None:
         if clock is None:
             clock, self.business_clock_source = business_clock_from_env()
         else:
             self.business_clock_source = "injected"
+        # Unset VAANIFLOW_API_TOKENS → no principals; a malformed value raises here.
+        self.identity_provider: IdentityProvider = (
+            identity_provider or StaticTokenIdentityProvider.from_env()
+        )
         self.repositories = SyntheticRepositories()
         self.orchestrator = VoiceWorkflowOrchestrator(repositories=self.repositories, clock=clock)
         self.runner = EvaluationRunner()
@@ -76,8 +85,11 @@ def get_container() -> AppContainer:
 ContainerDep = Annotated[AppContainer, Depends(get_container)]
 
 
-def reset_container(clock: Callable[[], datetime] | None = None) -> AppContainer:
+def reset_container(
+    clock: Callable[[], datetime] | None = None,
+    identity_provider: IdentityProvider | None = None,
+) -> AppContainer:
     """Reset container with fresh synthetic in-memory state (useful for tests)."""
     global _container
-    _container = AppContainer(clock=clock)
+    _container = AppContainer(clock=clock, identity_provider=identity_provider)
     return _container

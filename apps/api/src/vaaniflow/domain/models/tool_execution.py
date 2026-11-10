@@ -5,6 +5,7 @@ from uuid import UUID
 
 from pydantic import Field
 
+from vaaniflow.domain.models.principal import Principal
 from vaaniflow.domain.schemas.common import DomainSchema
 
 
@@ -63,6 +64,8 @@ class ToolExecution(DomainSchema):
     # OPERATOR_CONFIRMED_SUCCESS / OPERATOR_CONFIRMED_FAILURE (operator, P2-D).
     resolution: str | None = None
     resolved_by: UUID | None = None
+    # The authenticated operator who settled it (ADR-022); None for read-back.
+    resolved_actor: Principal | None = None
     resolved_at: datetime | None = None
     resolution_reason: str | None = None
     duration_ms: int | None = Field(default=None, ge=0)

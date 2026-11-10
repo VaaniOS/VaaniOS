@@ -4,6 +4,7 @@ from uuid import UUID
 
 from pydantic import Field
 
+from vaaniflow.domain.models.principal import Principal
 from vaaniflow.domain.schemas.common import DomainSchema
 
 
@@ -37,12 +38,16 @@ class Approval(DomainSchema):
     invoice_id: UUID | None = None
     dispatch_id: UUID | None = None
 
-    # None when no identity is known; the system never fabricates one.
+    # The authenticated principal that owns the run (None if the run has none).
     requested_by: UUID | None = None
+    # Set only from the principal that approved or rejected (ADR-022): never from
+    # a request body, header or callback payload.
     approved_by: UUID | None = None
     rejected_by: UUID | None = None
-    # Identities above are claims recorded for audit. There is no authentication
-    # layer yet, so they are never verified and never grant authorization.
+    approved_actor: Principal | None = None
+    rejected_actor: Principal | None = None
+    # True only when the approver/rejecter was authenticated by a credential; the
+    # synthetic evaluation actor is recorded as not authenticated.
     actor_authenticated: bool = False
 
     status: ApprovalStatus

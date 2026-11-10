@@ -12,6 +12,10 @@ from vaaniflow.execution.plan import StepOutcome
 
 
 class CreateRunRequest(BaseModel):
+    """The run's owner is the authenticated caller; no identity is accepted here."""
+
+    model_config = ConfigDict(extra="forbid")
+
     text: str | None = None
 
 
@@ -86,15 +90,13 @@ class ApproveRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     approval_id: UUID
-    # Recorded for audit only; identity is not authentication and grants nothing.
-    approved_by: UUID | None = None
+    # No identity field: the approver is the authenticated caller (ADR-022).
 
 
 class RejectRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     approval_id: UUID
-    rejected_by: UUID | None = None
     reason: str | None = None
 
 
@@ -116,14 +118,13 @@ class ConfirmRequest(BaseModel):
 
     reply: str = Field(min_length=1)
     confirmation_id: UUID | None = None
-    confirmed_by: UUID | None = None
 
 
 class ResolveUnknownRequest(BaseModel):
     """
     Operator resolution of one UNKNOWN execution. ``attempt`` must match the
     execution's current attempt. SUCCEEDED is accepted only if read-back verifies
-    a record committed by this operation; ``resolved_by`` is recorded, not trusted.
+    a record committed by this operation. The resolver is the authenticated caller.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -131,10 +132,12 @@ class ResolveUnknownRequest(BaseModel):
     attempt: int = Field(ge=1)
     outcome: Literal["SUCCEEDED", "FAILED"]
     reason: str = Field(min_length=1)
-    resolved_by: UUID | None = None
     entity_id: UUID | None = None
 
 
 class ManualHandoffRequest(BaseModel):
+    """The escalating operator is the authenticated caller; no actor id is accepted."""
+
+    model_config = ConfigDict(extra="forbid")
+
     reason: str = Field(min_length=1)
-    operator_id: UUID | None = None
