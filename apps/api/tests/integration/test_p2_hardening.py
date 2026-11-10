@@ -402,9 +402,14 @@ def test_approval_without_identity_records_none_not_a_fabricated_id() -> None:
 def test_superseded_rejected_and_expired_approvals_keep_their_history() -> None:
     container = _fresh_api()
     repos = container.repositories
-    run_id = client.post("/runs").json()["run_id"]
-    first = client.post(f"/runs/{run_id}/process", json={"text": KUMAR}).json()
-    second = client.post(f"/runs/{run_id}/process", json={"text": KUMAR_11}).json()
+    user_headers = {"Authorization": f"Bearer {uuid4()}"}
+    run_id = client.post("/runs", headers=user_headers).json()["run_id"]
+    first = client.post(
+        f"/runs/{run_id}/process", json={"text": KUMAR}, headers=user_headers
+    ).json()
+    second = client.post(
+        f"/runs/{run_id}/process", json={"text": KUMAR_11}, headers=user_headers
+    ).json()
 
     superseded = repos.approvals.get_by_id(approval_id=UUID(first["approval_id"]))
     assert superseded is not None
@@ -428,7 +433,9 @@ def test_superseded_rejected_and_expired_approvals_keep_their_history() -> None:
     assert record.rejected_by == rejector and record.approved_by is None
     assert record.rejection_reason == "Wrong site" and record.resolved_at == T
 
-    third = client.post(f"/runs/{run_id}/process", json={"text": KUMAR}).json()
+    third = client.post(
+        f"/runs/{run_id}/process", json={"text": KUMAR}, headers=user_headers
+    ).json()
     for inventory in repos.inventory.list_all():
         inventory.reserved_quantity += 1  # business state changes before approval
     client.post(f"/runs/{run_id}/approve", json={"approval_id": third["approval_id"]})
@@ -442,9 +449,12 @@ def test_superseded_rejected_and_expired_approvals_keep_their_history() -> None:
 
 def test_audit_identity_never_grants_authorization() -> None:
     container = _fresh_api()
-    run_id = client.post("/runs").json()["run_id"]
-    first = client.post(f"/runs/{run_id}/process", json={"text": KUMAR}).json()
-    client.post(f"/runs/{run_id}/process", json={"text": KUMAR_11})
+    user_headers = {"Authorization": f"Bearer {uuid4()}"}
+    run_id = client.post("/runs", headers=user_headers).json()["run_id"]
+    first = client.post(
+        f"/runs/{run_id}/process", json={"text": KUMAR}, headers=user_headers
+    ).json()
+    client.post(f"/runs/{run_id}/process", json={"text": KUMAR_11}, headers=user_headers)
 
     claimed_owner = client.post(
         f"/runs/{run_id}/approve",
@@ -1198,11 +1208,13 @@ def test_conflicting_links_without_a_price_pointer_are_not_guessed() -> None:
 def test_clarification_preserves_what_was_understood_and_what_is_missing() -> None:
     container = _fresh_api()
     repos = container.repositories
-    run_id = client.post("/runs").json()["run_id"]
+    user_headers = {"Authorization": f"Bearer {uuid4()}"}
+    run_id = client.post("/runs", headers=user_headers).json()["run_id"]
 
     body = client.post(
         f"/runs/{run_id}/process",
         json={"text": "Sharma Builders ko 200 bags UltraTech ya ACC cement dispatch karo, parso."},
+        headers=user_headers,
     ).json()
 
     view = body["clarification"]
@@ -1216,7 +1228,9 @@ def test_clarification_preserves_what_was_understood_and_what_is_missing() -> No
     assert record is not None and record.status is ClarificationStatus.OPEN
     assert record.understand_result.transcript.text.startswith("Sharma Builders ko 200 bags")
 
-    followup = client.post(f"/runs/{run_id}/clarify", json={"clarification": KUMAR}).json()
+    followup = client.post(
+        f"/runs/{run_id}/clarify", json={"clarification": KUMAR}, headers=user_headers
+    ).json()
 
     assert followup["superseded_clarification_ids"] == [view["clarification_id"]]
     record = repos.clarifications.get_by_id(clarification_id=UUID(view["clarification_id"]))
@@ -1282,7 +1296,10 @@ def test_resolution_guidance_matches_what_the_system_will_actually_do() -> None:
     assert _writes(container.repositories) == (1, 0, 0)  # dispatch not run
 
     # Following the old advice is refused exactly as the new guidance says.
-    retry = client.post(f"/runs/{run_id}/process", json={"text": KUMAR}).json()
+    user_headers = {"Authorization": f"Bearer {uuid4()}"}
+    retry = client.post(
+        f"/runs/{run_id}/process", json={"text": KUMAR}, headers=user_headers
+    ).json()
     assert retry["status"] == "BLOCKED"
     assert retry["duplicate_check"]["status"] == "DUPLICATE_FOUND"
     assert _writes(container.repositories) == (1, 0, 0)

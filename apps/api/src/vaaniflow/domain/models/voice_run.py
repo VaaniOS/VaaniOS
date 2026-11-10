@@ -44,6 +44,7 @@ class VoiceRun(DomainSchema):
     """
 
     run_id: UUID = Field(default_factory=uuid4)
+    owner_id: UUID | None = None
 
     status: VoiceRunStatus = VoiceRunStatus.CREATED
 

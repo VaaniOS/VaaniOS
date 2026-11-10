@@ -185,11 +185,18 @@ def _fresh_api() -> AppContainer:
 
 def test_clarify_supersedes_old_approval_and_returns_the_new_approval_id() -> None:
     container = _fresh_api()
-    run_id = client.post("/runs").json()["run_id"]
-    first = client.post(f"/runs/{run_id}/process", json={"text": KUMAR_DISPATCH}).json()
+    user_headers = {"Authorization": f"Bearer {uuid4()}"}
+    run_id = client.post("/runs", headers=user_headers).json()["run_id"]
+    first = client.post(
+        f"/runs/{run_id}/process", json={"text": KUMAR_DISPATCH}, headers=user_headers
+    ).json()
     assert first["approval_id"] is not None
 
-    clarified = client.post(f"/runs/{run_id}/clarify", json={"clarification": SHARMA_DISPATCH})
+    clarified = client.post(
+        f"/runs/{run_id}/clarify",
+        json={"clarification": SHARMA_DISPATCH},
+        headers=user_headers,
+    )
 
     assert clarified.status_code == 200
     body = clarified.json()

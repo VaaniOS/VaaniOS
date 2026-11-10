@@ -27,6 +27,7 @@ class ApprovalService:
         plan_fingerprint: str | None = None,
         order_id: UUID | None = None,
         invoice_id: UUID | None = None,
+        actor_authenticated: bool = False,
         now: datetime | None = None,
     ) -> Approval:
         """Create a new approval request bound to its run, plan and business snapshot."""
@@ -39,6 +40,7 @@ class ApprovalService:
             order_id=order_id,
             invoice_id=invoice_id,
             requested_by=requested_by,
+            actor_authenticated=actor_authenticated,
             status=ApprovalStatus.REQUESTED,
             snapshot_version=snapshot_version,
             requested_at=current_time,

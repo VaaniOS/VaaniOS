@@ -3,7 +3,8 @@ from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, status
 
-from vaaniflow.api.dependencies import ContainerDep
+from vaaniflow.api.auth import PrincipalDep
+from vaaniflow.api.dependencies import AppContainer, ContainerDep
 from vaaniflow.api.schemas import (
     ApproveRequest,
     ClarificationView,
@@ -21,8 +22,10 @@ from vaaniflow.api.schemas import (
 )
 from vaaniflow.application.services.audit import RunAuditService
 from vaaniflow.application.services.orchestrator import ApprovalFlowError, WorkflowResult
+from vaaniflow.domain.models.approval import ApprovalStatus
+from vaaniflow.domain.models.principal import Role
 from vaaniflow.domain.models.tool_execution import ToolExecutionStatus
-from vaaniflow.domain.models.voice_run import VoiceRunStatus
+from vaaniflow.domain.models.voice_run import VoiceRun, VoiceRunStatus
 from vaaniflow.execution.service import OperatorResolutionError
 
 router = APIRouter(prefix="/runs", tags=["Runs"])
@@ -117,8 +120,10 @@ def _approval_http_error(error: ApprovalFlowError | OperatorResolutionError) -> 
 def create_run(
     container: ContainerDep,
     payload: CreateRunRequest | None = None,
+    principal: PrincipalDep = None,
 ) -> CreateRunResponse:
-    run = container.orchestrator.start_run()
+    owner_id = principal.principal_id if principal else None
+    run = container.orchestrator.start_run(owner_id=owner_id)
     if payload and payload.text:
         container.orchestrator.process_text(text=payload.text, run_id=run.run_id)
         refreshed = container.repositories.runs.get_by_id(run_id=run.run_id)
@@ -145,6 +150,7 @@ def get_run(
         )
     return {
         "run_id": str(run.run_id),
+        "owner_id": str(run.owner_id) if run.owner_id else None,
         "status": run.status.value,
         "created_at": run.created_at.isoformat(),
         "updated_at": run.updated_at.isoformat(),
@@ -153,11 +159,23 @@ def get_run(
     }
 
 
+def _has_pending_approval(container: AppContainer, run: VoiceRun) -> bool:
+    if run.status is VoiceRunStatus.APPROVAL_REQUIRED:
+        return True
+    if hasattr(container.repositories, "pending_executions"):
+        for pending in container.repositories.pending_executions.list_by_run(run_id=run.run_id):
+            approval = container.repositories.approvals.get_by_id(approval_id=pending.approval_id)
+            if approval is not None and approval.status is ApprovalStatus.REQUESTED:
+                return True
+    return False
+
+
 @router.post("/{run_id}/process", response_model=WorkflowResponse)
 def process_run(
     run_id: UUID,
     payload: ProcessRunRequest,
     container: ContainerDep,
+    principal: PrincipalDep = None,
 ) -> WorkflowResponse:
     text = payload.text
     if not text:
@@ -165,6 +183,55 @@ def process_run(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Instruction text must be provided for processing.",
         )
+
+    run = container.repositories.runs.get_by_id(run_id=run_id)
+    if not run:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Run {run_id} not found.",
+        )
+
+    # 1. Prevent anonymous users from superseding an existing pending approval
+    if _has_pending_approval(container, run) and principal is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "code": "AUTHENTICATION_REQUIRED",
+                "message": "Anonymous users are not permitted to supersede an existing pending approval.",
+            },
+        )
+
+    # 2. Require an authenticated principal when adding an instruction to an existing run
+    is_existing_active_run = (
+        run.owner_id is not None
+        or run.status is not VoiceRunStatus.CREATED
+        or run.transcript_id is not None
+    )
+    if is_existing_active_run and principal is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "code": "AUTHENTICATION_REQUIRED",
+                "message": "Authenticated principal required when adding an instruction to an existing run.",
+            },
+        )
+
+    # 3. Enforce requester/run ownership
+    if principal is not None:
+        if run.owner_id is None:
+            run.owner_id = principal.principal_id
+            container.repositories.runs.save(run=run)
+        elif run.owner_id != principal.principal_id and principal.role not in (
+            Role.ADMIN,
+            Role.OPERATOR,
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "code": "FORBIDDEN",
+                    "message": "Principal is not authorized to alter this run; requester ownership violation.",
+                },
+            )
 
     result = container.orchestrator.process_text(text=text, run_id=run_id)
     return _to_response(result)
@@ -264,10 +331,53 @@ def clarify_run(
     run_id: UUID,
     payload: ClarifyRequest,
     container: ContainerDep,
+    principal: PrincipalDep = None,
 ) -> WorkflowResponse:
     run = container.repositories.runs.get_by_id(run_id=run_id)
     if not run:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found.")
+
+    # 1. Do not allow clarification to silently reopen an escalated run
+    if run.status is VoiceRunStatus.HANDOFF:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "RUN_ESCALATED",
+                "message": f"Run {run_id} has been escalated to human handoff and cannot be clarified without operator resolution.",
+            },
+        )
+
+    # 2. Require authentication + appropriate authorization
+    if principal is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "code": "AUTHENTICATION_REQUIRED",
+                "message": "Authentication required to clarify a run.",
+            },
+        )
+
+    # 3. Anonymous users (and unauthorized users) must not be able to reopen or alter another user's run
+    if (
+        run.owner_id is not None
+        and run.owner_id != principal.principal_id
+        and principal.role
+        not in (
+            Role.ADMIN,
+            Role.OPERATOR,
+        )
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "FORBIDDEN",
+                "message": "Principal is not authorized to alter another user's run.",
+            },
+        )
+
+    if run.owner_id is None:
+        run.owner_id = principal.principal_id
+        container.repositories.runs.save(run=run)
 
     # Resume with clarified text. Any approval still pending on this run is
     # superseded; the response carries the new approval_id if one is requested.

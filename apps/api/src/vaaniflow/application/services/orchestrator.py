@@ -184,11 +184,18 @@ class VoiceWorkflowOrchestrator:
     # Run lifecycle
     # ------------------------------------------------------------------ #
 
-    def start_run(self, *, run_id: UUID | None = None, now: datetime | None = None) -> VoiceRun:
+    def start_run(
+        self,
+        *,
+        run_id: UUID | None = None,
+        owner_id: UUID | None = None,
+        now: datetime | None = None,
+    ) -> VoiceRun:
         """Create and persist a new VoiceRun aggregate."""
         t = now or self.clock()
         run = VoiceRun(
             run_id=run_id or uuid4(),
+            owner_id=owner_id,
             status=VoiceRunStatus.CREATED,
             created_at=t,
             updated_at=t,
@@ -479,6 +486,8 @@ class VoiceWorkflowOrchestrator:
             snapshot_version=plan.snapshot_version,
             plan_id=plan.plan_id,
             plan_fingerprint=plan.fingerprint,
+            requested_by=run.owner_id,
+            actor_authenticated=run.owner_id is not None,
             now=t,
         )
         self.repositories.pending_executions.save(
