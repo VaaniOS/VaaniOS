@@ -2,20 +2,32 @@
 
 **Speak it. Structure it. Execute.**
 
-VaaniOS is an agentic voice-to-business-action platform designed to turn messy,
-code-switched voice instructions into typed, evaluated business intent. It is built so
-that **raw speech never directly becomes an irreversible business action**. The current
-challenge scenario, built for the Gnani AI Great Indian AI Internship Challenge, focuses
-on Indian SME workflows: Hinglish voice notes from a noisy wholesale shop floor.
+> Turn messy Hinglish voice instructions into safe, structured business actions.
+
+```text
+🎙️ Voice → 🧠 Intent → 🏢 Business Context → 🛡️ Validation → 👤 Approval → ⚡ Execution → 🔍 Verification
+```
+
+Built for the **Gnani AI Great Indian AI Internship Challenge**. It focuses on Indian SME
+workflows, where business instructions often arrive as natural, code-switched voice
+messages.
 
 ![Python 3.12](https://img.shields.io/badge/python-3.12-blue)
 
 > [!IMPORTANT]
-> **Current status:** the **UNDERSTAND** side (audio → transcript → semantic state →
-> input evaluation → handoff) is implemented and tested. The **ACT** side (business
-> context, agent orchestration, validation, risk/policy, approval, execution,
-> verification) is **designed but not yet implemented**. Nothing in this repository
-> creates orders, invoices or dispatches today.
+> **Current status:** VaaniOS runs the complete voice-to-business-action loop over
+> deterministic, synthetic, in-memory business data. Both UNDERSTAND and ACT are
+> implemented and tested. This is a prototype, not a production system: production
+> integrations, persistent storage and production identity management are future work.
+
+| Layer | Status |
+|---|---|
+| **UNDERSTAND**: audio, ASR, semantic compilation, input evaluation | ✅ Implemented |
+| **ACT**: business context, validation, risk/policy, planning | ✅ Implemented (synthetic data) |
+| Confirmation, approval, idempotent execution, UNKNOWN handling | ✅ Implemented |
+| Read-back verification, audit trail, traces, evaluation sandbox | ✅ Implemented |
+| HTTP API (FastAPI) with role-based authentication | ✅ Implemented (only on the routes that authorize something, see [Route authentication boundary](#route-authentication-boundary)) |
+| Production integrations: ERP, WhatsApp, telephony, TTS, persistent storage, identity provider | 🔜 Future |
 
 The Python package is called `vaaniflow` (the project's working name in the design
 documents is *VaaniFlow*).
@@ -24,55 +36,281 @@ documents is *VaaniFlow*).
 
 ## Table of contents
 
+- [The problem](#the-problem)
+- [The solution](#the-solution)
+- [Demo](#-demo)
 - [Why VaaniOS](#why-vaanios)
+- [Safety by design](#safety-by-design)
 - [Architecture](#architecture)
-- [What UNDERSTAND produces](#what-understand-produces)
-- [Example: the canonical voice note](#example-the-canonical-voice-note)
-- [Safety behaviour of the semantic layer](#safety-behaviour-of-the-semantic-layer)
-- [Getting started](#getting-started)
-- [Using the pipeline](#using-the-pipeline)
-- [Gnani speech-to-text integration](#gnani-speech-to-text-integration)
-- [Testing](#testing)
-- [Quality checks](#quality-checks)
-- [Repository structure](#repository-structure)
-- [Developer workflow](#developer-workflow)
-- [Current status](#current-status)
-- [Design principles](#design-principles)
-- [Known limitations](#known-limitations)
-- [Documentation map](#documentation-map)
-- [Contributing](#contributing)
-- [License](#license)
+- [What the prototype demonstrates](#what-the-prototype-demonstrates)
+- **Technical reference**
+  - [What UNDERSTAND produces](#what-understand-produces)
+  - [Example: the canonical voice note](#example-the-canonical-voice-note)
+  - [Safety behaviour of the semantic layer](#safety-behaviour-of-the-semantic-layer)
+  - [Getting started](#getting-started)
+  - [Using the pipeline](#using-the-pipeline)
+  - [Gnani speech-to-text integration](#gnani-speech-to-text-integration)
+  - [Testing](#testing)
+  - [Quality checks](#quality-checks)
+  - [Repository structure](#repository-structure)
+  - [Developer workflow](#developer-workflow)
+  - [Current status](#current-status)
+  - [Design principles](#design-principles)
+  - [Known limitations](#known-limitations)
+  - [Documentation map](#documentation-map)
+  - [Contributing](#contributing)
+  - [License](#license)
 
 ---
 
-## Why VaaniOS
+## The problem
 
-A wholesale trader sends an 8-second WhatsApp voice note:
+In many Indian SMEs a business instruction is not an API request. It is a voice note
+recorded on a noisy shop floor. A cement and steel wholesaler in Peenya sends his
+assistant an 8-second WhatsApp message:
 
 > *"Arre Suresh, Sharma Builders ko turant 200 bag Ultratech cement dispatch karo. Rate
 > wahi lagana jo parso bataya tha—chaar sau bees rupaye per bag plus GST. Invoice bana
 > ke mujhe WhatsApp pe approve karne bhej do."*
 
-Turning that into a business action safely requires more than transcription. The
-request mixes Hindi and English, spells numbers as words, refers to a price "from the
-day before yesterday", asks for several actions, and names a customer that may match
-more than one business record.
+That one sentence contains:
 
-VaaniOS separates the problem into two layers:
+- **Code-switching**: Hindi grammar with English business vocabulary.
+- **Spoken numbers**: "chaar sau bees" is 420.
+- **Names, not identifiers**: "Sharma Builders" may match more than one customer;
+  "Ultratech cement" may match more than one SKU.
+- **A relative reference**: "the rate I told you *parso*" (the day before yesterday)
+  only means something once it is checked against the business's quote history.
+- **Several actions**: dispatch, invoice draft, notification and owner approval.
+- **Urgency** ("turant") and **implicit context**: the delivery address, the stock and
+  the tax rule are never spoken.
 
-| Layer | Question it answers | Status |
-|---|---|---|
-| **UNDERSTAND** | *What did the human actually mean, and is it specified well enough to act on?* | Implemented |
-| **ACT** | *Given that meaning and what the business knows, what should happen?* | Planned |
+Getting the words right is only the first step. **The hard problem isn't
+transcription. It's safely turning speech into business state.** A transcription error
+or a guessed customer becomes a wrong dispatch, a wrong invoice or a wrong price.
 
-The interesting engineering is the boundary: the semantic layer may interpret language,
-but it must **not invent business facts** (customer IDs, SKUs, quotes, stock, tax
-amounts, calendar dates) and must **not silently resolve ambiguity** into something that
-looks executable.
+---
+
+## The solution
+
+VaaniOS treats every voice instruction as untrusted input. It compiles the instruction
+into typed state, grounds that state in business records, and lets only a validated,
+approved and verified plan change anything.
+
+```text
+Voice
+  ↓
+Audio preprocessing                (format normalisation, measured quality)
+  ↓
+ASR                                (Gnani adapter · mock adapter for tests)
+  ↓
+Semantic compiler                  (deterministic, rule-based)
+  ↓
+Typed SemanticState + input evaluation
+  ↓  ── handoff boundary: UnderstandResult ──
+Business context resolution        (customer · product · quote · stock · tax · date)
+  ↓
+Validation + risk / policy         (deterministic, no LLM decides execution)
+  ↓
+Plan                               (requested − negated actions, duplicate check)
+  ↓
+Confirmation / approval / clarification / human handoff
+  ↓
+Execution                          (idempotency keys, UNKNOWN handling)
+  ↓
+Read-back verification
+  ↓
+Audit / trace
+```
+
+The core trust boundary:
+
+> **Raw speech never directly becomes an irreversible business action.**
+>
+> The semantic layer interprets language. Business systems provide business truth.
+> Deterministic validation and policy control execution.
+
+---
+
+## 🎬 Demo
+
+### 1. Speech becomes typed state (UNDERSTAND)
+
+The voice note above compiles to this state. It is a golden test
+([`test_compiler.py`](apps/api/tests/unit/semantic/test_compiler.py)).
+
+```text
+intent:       CREATE_DISPATCH_ORDER
+customer:     "Sharma Builders"         (a name, not a customer ID)
+addressee:    "Suresh"
+item:         "Ultratech cement"        (not a SKU)
+quantity:     200 bag
+price:        ₹420 / bag                (a spoken claim, still to be checked)
+price_ref:    "Rate wahi …" anchored to "parso" → DAY_OFFSET:-2, PAST
+tax:          GST exclusive             (the instruction only, no rate or amount)
+urgency:      HIGH                      ("turant")
+
+actions:
+  DISPATCH
+  CREATE_INVOICE_DRAFT
+  SEND_NOTIFICATION                     (to the speaker, WhatsApp)
+  REQUEST_APPROVAL                      (by the speaker)
+
+actionability: PARTIAL                  ("Rate wahi" and "parso" need business context)
+```
+
+### 2. State is grounded in business data (ACT)
+
+Running the same note through ACT on the synthetic dataset gives the following trace.
+The business clock is the dataset's 2026-10-17, Asia/Kolkata.
+
+```text
+UNDERSTAND                 PARTIAL: references must be resolved by business context
+    ↓
+Resolve customer           "Sharma Builders" → one synthetic customer record
+    ↓
+Resolve product            "Ultratech cement" → one catalogue SKU, unit bag
+    ↓
+Resolve date               "parso" → 2026-10-15 (relative to when the user spoke)
+    ↓
+Resolve historical quote   quote given 2026-10-15: ₹420/bag, valid until 2026-11-15
+                           spoken ₹420 matches the quote, so no confirmation is needed
+    ↓
+Inventory / tax            stock available; synthetic rule GST-2026-KA-CEM (CGST 14% + SGST 14%)
+                           ₹84,000.00 + ₹23,520.00 tax = ₹1,07,520.00
+    ↓
+Policy + risk              APPROVAL_REQUIRED: consequential financial action
+    ↓
+Exact plan                 create_order → create_invoice_draft → dispatch_order
+                           "Nothing has been executed."
+                           SEND_NOTIFICATION: not supported, will not be performed
+    ↓
+Approval                   an authenticated OWNER approves this plan's approval id
+    ↓
+Execution                  three writes, each under its own idempotency key
+    ↓
+Read-back verification     order DRAFT ✓   invoice DRAFT ✓   dispatch DISPATCHED ✓
+    ↓
+Audit                      run ends HANDOFF: the unsupported WhatsApp notification is
+                           handed to an operator, not claimed as sent
+```
+
+The tax rate comes from a versioned rule in the synthetic dataset. The architecture does
+not assume one rate for every cement transaction.
+
+### 3. When reality doesn't line up, nothing executes silently
+
+Each row is an evaluation-sandbox scenario (A–P) run through the production
+orchestrator and judged from the resulting repository state
+([`evaluation/scenarios.py`](apps/api/src/vaaniflow/evaluation/scenarios.py)):
+
+| Situation | Outcome |
+|---|---|
+| Two customers match "Sharma Builders" | `CLARIFY`: no write |
+| "UltraTech cement" matches several SKUs | `CLARIFY`: no write |
+| ASR hears "2000 bags" | `CONFIRM`: the quantity is kept and flagged as unusually large; approval is still required afterwards |
+| The referenced quote has expired | `HUMAN_HANDOFF`: the stale price is not applied |
+| No quote exists on the referenced date | `CLARIFY`: no other quote is substituted |
+| Only part of the quantity is in stock | `HUMAN_HANDOFF`: no dispatch |
+| "Dispatch **mat** karo" (negated) | `CLARIFY`: the negated action is never planned |
+| An identical order is already open | `BLOCKED`: no duplicate order |
+| Stock changes between approval request and approval | The approval expires; run `FAILED`, nothing written |
+| An approval superseded by a newer instruction is used | Refused (`APPROVAL_SUPERSEDED`) |
+| Invoice API fails | `PARTIALLY_COMPLETED`: no invoice is claimed and dispatch does not run |
+| Dispatch API fails after the invoice | `PARTIALLY_COMPLETED`: the dispatch is not claimed |
+| A write times out (may or may not have committed) | `UNKNOWN`: reconciled by read-back, never blindly retried; handed to an operator |
+
+### Run it yourself
+
+```bash
+# Start the API with the synthetic business clock and one demo OWNER token
+export VAANIFLOW_BUSINESS_CLOCK=synthetic
+export VAANIFLOW_API_TOKENS='{"demo-owner-token-0001": {"actor_id": "11111111-1111-4111-8111-111111111111", "name": "Ramesh", "roles": ["OWNER"]}}'
+uvicorn vaaniflow.api.app:app
+
+# In a second terminal: every sandbox scenario, scored from actual state
+curl -s -X POST localhost:8000/sandbox/evaluate-all
+curl -s -X POST localhost:8000/sandbox/scenarios/scenario_c/run   # ambiguous customer
+
+# The canonical note, end to end
+RUN=$(curl -s -X POST localhost:8000/runs | jq -r .run_id)
+curl -s -X POST localhost:8000/runs/$RUN/process -H 'Content-Type: application/json' \
+  -d '{"text": "Arre Suresh, Sharma Builders ko turant 200 bag Ultratech cement dispatch karo. Rate wahi lagana jo parso bataya tha—chaar sau bees rupaye per bag plus GST. Invoice bana ke mujhe WhatsApp pe approve karne bhej do."}'
+# → status APPROVAL_REQUIRED, with an approval_id. Without a token, /approve answers 401.
+curl -s -X POST localhost:8000/runs/$RUN/approve -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer demo-owner-token-0001' -d '{"approval_id": "<approval_id>"}'
+curl -s localhost:8000/runs/$RUN/audit -H 'Authorization: Bearer demo-owner-token-0001'
+```
+
+The token above is a local demo value; never reuse it outside a sandbox. Interactive API
+docs are served at `http://localhost:8000/docs`. Without `VAANIFLOW_BUSINESS_CLOCK=synthetic`
+the API uses the real clock, and the synthetic quotes may not match "parso".
+
+---
+
+## Why VaaniOS
+
+| Naive voice agent | VaaniOS |
+|---|---|
+| Speech → tool call | Speech → typed `SemanticState` → validated plan |
+| The model fills in business facts | Business context resolves IDs, prices, stock, tax and dates |
+| Ambiguity is resolved by a guess | Ambiguity stays explicit and leads to a clarification |
+| "Same rate as before" means whatever was said | The spoken price is checked against the one applicable quote |
+| Approval is a conversational "ok" | Approval is bound to the run, plan fingerprint and business snapshot |
+| A timeout triggers a retry | `UNKNOWN` is reconciled by read-back before anything is retried |
+| A tool response counts as success | Success means the record was read back and verified |
+| One failed step hides behind a summary | Per-step outcomes; a partial run is reported as partial |
+
+UNDERSTAND may interpret language, but it must **not invent business facts** (customer
+IDs, SKUs, quotes, stock, tax amounts, calendar dates). It also must **not silently
+resolve ambiguity** into something that looks executable. ACT decides what happens
+using business records and deterministic rules.
+
+---
+
+## Safety by design
+
+These guarantees are implemented and covered by regression tests that check repository
+state. [ACT safety semantics](#act-safety-semantics) gives the exact rules.
+
+- **Negation is never inverted.** A negated action is recorded in `negated_actions` and
+  never planned.
+- **Ambiguity is not a decision.** Alternative customers, products, quantities or
+  prices lead to clarification, never to a pick.
+- **Approval is bound.** It covers one run, one plan fingerprint and one business
+  snapshot. Only an authenticated `OWNER` can give it, and nothing in the request body
+  can name the approver.
+- **Stale approval is refused.** A changed plan or business snapshot expires the
+  approval, and a newer instruction supersedes it.
+- **Pricing has one authority.** The execution price comes from exactly one quote valid
+  on the business date; a spoken price is only a claim compared against it. No
+  applicable quote means no executable sale.
+- **UNKNOWN is not FAILED, and not SUCCESS.** A write that may have committed is
+  reconciled by read-back by idempotency key and never blindly retried.
+- **Every planned write has a verification contract.** A tool without one is never
+  planned, and only verified steps are reported as done.
+- **Partial execution is reported honestly.** Each step is VERIFIED, FAILED, UNKNOWN or
+  NOT_ATTEMPTED. Nothing is rolled back, and no rollback is claimed.
+- **No false success.** Messages describe record status as it is (a DRAFT order reads as
+  DRAFT), and unsupported actions are named as not performed.
 
 ---
 
 ## Architecture
+
+VaaniOS has two layers joined by one typed handoff object:
+
+```text
+UNDERSTAND   Audio → Preprocessing → ASR → SemanticState → Input evaluation
+                                                   ↓
+                                       UnderstandResult (handoff)
+                                                   ↓
+ACT          Context → Validation / risk / policy → Plan → Approval → Execution → Verification → Audit
+```
+
+UNDERSTAND answers *what did the human mean, and is it specified well enough to act
+on?* ACT answers *given that meaning and what the business knows, what should happen?*
+UNDERSTAND never queries business data. ACT never re-interprets language.
 
 ```mermaid
 flowchart TD
@@ -113,6 +351,37 @@ flowchart TD
 Dependency direction follows the design: the domain schemas import no framework or
 provider code, application services depend on ports, and the Gnani SDK is only
 imported inside `providers/gnani.py`.
+
+---
+
+## What the prototype demonstrates
+
+The prototype runs the complete voice-to-business-action loop on synthetic, in-memory
+business data: a voice instruction in, and a verified order, invoice draft and dispatch
+out (or a clarification, confirmation or handoff when the facts do not support
+execution). The HTTP API takes the instruction as text. Audio goes through the Python
+services (`UnderstandAudioService`, or the orchestrator's `process_audio_artifact`). The
+end-to-end safety architecture is implemented. Production connectors are the next
+integration layer:
+
+| Future integration work | Today |
+|---|---|
+| Production identity provider | Static bearer tokens from an environment variable |
+| Persistent storage | In-memory repositories behind the `RepositoryBundle` port |
+| Production business systems (ERP, inventory, invoicing) | Synthetic dataset (`infrastructure/repositories/synthetic_data.py`) |
+| WhatsApp / telephony intake and notifications | Text through the HTTP API, audio through the Python services; notifications are reported as not performed |
+| Operator dashboard | HTTP API plus audit and trace endpoints |
+| Spoken responses (TTS) | Text messages only |
+
+Some limitations are part of the current design, not only missing connectors: one line
+item per request, no catalogue pricing, unauthenticated instruction and read routes,
+and no per-run ownership. See [Known limitations](#known-limitations) and
+[Route authentication boundary](#route-authentication-boundary).
+
+---
+
+> **Technical reference.** The sections below are the engineering detail behind the
+> demo: contracts, safety rules, setup, integration and tests.
 
 ---
 
@@ -165,7 +434,7 @@ policy.
 
 ## Example: the canonical voice note
 
-The scenario from [Why VaaniOS](#why-vaanios) is a golden test
+The scenario from the [Demo](#-demo) is a golden test
 ([`tests/unit/semantic/test_compiler.py`](apps/api/tests/unit/semantic/test_compiler.py)).
 Its compiled state, abridged:
 
@@ -196,8 +465,8 @@ What UNDERSTAND **deliberately does not decide**:
 - whether 200 bags are in stock, the GST amount, or the calendar date of "parso";
 - whether anything should be invoiced or dispatched.
 
-Those are ACT responsibilities. No order, invoice or dispatch is created by this
-repository.
+Those are ACT responsibilities (see the [Demo](#-demo)). UNDERSTAND itself never
+creates an order, invoice or dispatch; ACT does so only after validation and approval.
 
 ---
 
@@ -220,9 +489,9 @@ behaviours are covered by regression tests
 | "kal" / "parso" / "narso" without tense evidence | `TEMPORAL_AMBIGUITY` instead of guessing past or future |
 
 > [!NOTE]
-> These guarantees are about **interpretation**. The layer that prevents unsafe
-> **execution** — validation, risk/policy, approval and verification — belongs to ACT
-> and is not implemented yet.
+> These guarantees are about **interpretation**. Unsafe **execution** is prevented by
+> ACT (validation, risk/policy, approval and verification); see
+> [ACT safety semantics](#act-safety-semantics).
 
 ---
 
@@ -261,26 +530,30 @@ pytest -q
 
 ### Environment variables
 
-The application code itself reads no environment variables. The only variable in use is
-read by the Gnani SDK:
-
-| Variable | Purpose | Required? | Example |
+| Variable | Purpose | Default | Example |
 |---|---|---|---|
-| `GNANI_API_KEY` | API key read by `gnani.stt.GnaniSTTClient` when no key is passed to its constructor | Only for live Gnani calls | `GNANI_API_KEY=<your-gnani-api-key>` |
+| `GNANI_API_KEY` | API key read by `gnani.stt.GnaniSTTClient` when no key is passed to its constructor | none (only live Gnani calls need it) | `GNANI_API_KEY=<your-gnani-api-key>` |
+| `VAANIFLOW_API_TOKENS` | Bearer tokens → principals for the API (see [ACT safety semantics](#act-safety-semantics)). JSON map; tokens ≥ 16 characters; roles `OWNER`, `REQUESTER`, `OPERATOR`, `AUDITOR`. A malformed value fails at startup | **unset → every protected route answers 401** | `{"<token>": {"actor_id": "<uuid>", "name": "Ramesh", "roles": ["OWNER"]}}` |
+| `VAANIFLOW_CORS_ORIGINS` | Comma-separated exact origins allowed by CORS | `http://localhost:3000,http://127.0.0.1:3000` | `https://dashboard.example.com` |
+| `VAANIFLOW_CORS_ALLOW_CREDENTIALS` | Allow credentialed CORS (`true`/`false`); refused together with a `*` origin | `false` | `false` |
+| `VAANIFLOW_BUSINESS_CLOCK` | Business clock: unset = real time; `synthetic` = the synthetic dataset's 2026-10-17 12:00 IST; or a timezone-aware ISO-8601 instant. Invalid values fail, never fall back | real clock | `synthetic` |
 
 ```bash
 export GNANI_API_KEY="<your-gnani-api-key>"
 ```
 
-There is no `.env` loader or settings module yet. Never commit keys (`.env` files are
-git-ignored).
+There is no `.env` loader. Never commit keys or tokens (`.env` files are git-ignored).
 
 ### Entry points
 
-> [!NOTE]
-> There is **no HTTP server or CLI yet**. `fastapi` and `uvicorn` are declared
-> dependencies, but `apps/api/src/vaaniflow/api/` is an empty package. The supported
-> entry points are the application services, used from Python as shown below.
+- **HTTP API**: `uvicorn vaaniflow.api.app:app` serves the FastAPI app
+  (`apps/api/src/vaaniflow/api/app.py`; OpenAPI docs at `/docs`). See
+  [Run it yourself](#run-it-yourself) and
+  [Route authentication boundary](#route-authentication-boundary).
+- **Python**: the UNDERSTAND application services, as shown below, and the ACT
+  orchestrator (`application/services/orchestrator.py`).
+
+There is no CLI.
 
 ---
 
@@ -430,7 +703,23 @@ so the suite needs no credentials or network.
 pytest -q
 ```
 
-At the time of writing the suite collects and passes **519 tests**.
+At the time of writing the suite collects and passes **583 tests**. No test needs
+credentials or network access.
+
+What they prove, with exact-value assertions and checks on repository state rather than
+on messages:
+
+- **Semantic safety**: negation, ambiguity (customer, product, quantity, price),
+  numeric fidelity ("2000" stays 2000), corrections, temporal references
+- **Approval**: binding to run, plan and snapshot; stale and superseded approvals;
+  authenticated approvers only
+- **Pricing**: quote validity, the temporal quote match for "parso", spoken price as a
+  claim, no fallback quote
+- **Execution**: idempotency, `UNKNOWN` outcomes and reconciliation, partial execution,
+  read-back verification, duplicate order detection
+- **Workflow**: confirmation, clarification, operator resolution, escalation, the audit
+  trail, ACT orchestration and the HTTP API
+- **Sandbox**: scenarios A–P through the production orchestrator
 
 | Category | Location | What it covers |
 |---|---|---|
@@ -438,7 +727,7 @@ At the time of writing the suite collects and passes **519 tests**.
 | Contract | `apps/api/tests/contracts/` | `SemanticState` and `UnderstandResult` invariants, JSON round-trips, absence of business identifiers, existing ACT-side domain contracts |
 | Integration | `apps/api/tests/integration/` | End-to-end UNDERSTAND pipeline with real local storage and WAV preprocessing, mock ASR and a fake Gnani client; ACT orchestration and HTTP API |
 | ACT safety regressions | `apps/api/tests/integration/test_act_safety.py`, `test_api_approval.py`, `test_p1_*.py`, `test_p2_hardening.py` | Actionability and negation gates, approval binding and supersession, temporal quote matching, quote validity, pricing authority, UNKNOWN outcomes and reconciliation, partial execution, verification, duplicate orders, confirmation, operator resolution, audit trail — asserting repository state |
-| ACT unit | `apps/api/tests/unit/{context,validation,policy,execution,handoff,evaluation,traces,infrastructure}/` | Resolvers, validation engine, policy matrix, tools, verifier, approvals, handoff, sandbox scenarios A–J |
+| ACT unit | `apps/api/tests/unit/{context,validation,policy,execution,handoff,evaluation,traces,infrastructure}/` | Resolvers, validation engine, policy matrix, tools, verifier, approvals, handoff, sandbox scenarios A–P |
 | Safety regressions | `apps/api/tests/unit/semantic/test_safety_regressions.py` | Negation, product/customer/quantity/price alternatives, numeric fidelity, fallback products |
 
 Useful subsets:
@@ -479,6 +768,7 @@ VaaniOS/
 ├── pyproject.toml                # package, dependencies, pytest/ruff/mypy config
 ├── System-Design/                # canonical architecture and design (01–24, ADRs)
 ├── docs/
+│   ├── HANDOVER.md               # engineering handover and status
 │   └── architecture/
 │       └── understand-handoff.md # UNDERSTAND → ACT consumer guide
 └── apps/
@@ -505,7 +795,7 @@ VaaniOS/
         │   ├── execution/         # plans, tools, idempotent execution, verifier,
         │   │                      # approvals, duplicate detection
         │   ├── handoff/ traces/   # structured human handoff, run traces
-        │   ├── evaluation/        # failure-injection sandbox (scenarios A–J)
+        │   ├── evaluation/        # failure-injection sandbox (scenarios A–P)
         │   ├── api/               # FastAPI app and routers
         │   └── config/
         └── tests/
@@ -574,7 +864,10 @@ Over synthetic, in-memory business data (`infrastructure/repositories/synthetic_
 - Execution with idempotency keys, read-back verification of every write, UNKNOWN handling
 - Structured human handoff, bound confirmation, operator resolution of UNKNOWN outcomes
 - Business-level duplicate order detection
-- Traces, an end-to-end audit endpoint, and a failure-injection sandbox (scenarios A–J)
+- Traces, an end-to-end audit endpoint, and a failure-injection sandbox (scenarios A–P)
+- Bearer-token authentication with role-based permissions on the approve, reject,
+  confirm, resolve, escalate and audit routes (instruction, read, search and sandbox
+  routes are not yet authenticated — see [Route authentication boundary](#route-authentication-boundary))
 - FastAPI HTTP API (`apps/api/src/vaaniflow/api/`)
 
 ### ACT safety semantics
@@ -583,17 +876,55 @@ Over synthetic, in-memory business data (`infrastructure/repositories/synthetic_
 |---|---|
 | Pricing authority | The execution price is the price of exactly one quote valid on the business date. A spoken price is a claim compared against it (mismatch → confirmation). **No applicable quote → no executable sale** (handoff); a referenced rate with no matching quote → clarification. No other quote is substituted. |
 | Historical references | "Rate wahi jo parso bataya tha" matches only quotes given on the date of the temporal expression linked to *the price's own reference*. "parso" is resolved against when the user spoke, not when approval happens. |
-| Approval | Every business write needs an approval bound to its run, plan fingerprint and business snapshot. A new instruction on the run supersedes any pending approval (`SUPERSEDED`, kept for audit). Approval re-validates; a changed plan or snapshot expires it. Approver identity is recorded for audit only — there is no authentication yet, so `actor_authenticated` is always `false` and identity never authorizes anything. |
+| Approval | Every business write needs an approval bound to its run, plan fingerprint and business snapshot. A new instruction (or an operator escalation) supersedes any pending approval (`SUPERSEDED`, kept for audit). Approval re-validates; a changed plan or snapshot expires it. Only an authenticated `OWNER` can approve or reject, and the recorded approver is that authenticated actor — never an identity from the request body. |
 | Confirmation | A CONFIRM decision creates a confirmation bound to one run, the exact warnings asked about and the business snapshot. A yes/no reply (`POST /runs/{id}/confirm`) answers only that confirmation; if the facts changed it expires. Confirmation never executes — approval is still required. |
 | Duplicate orders | An open equivalent order (same customer, items, price, destination) blocks a new one; a completed one blocks only on the same business day. Orders the system creates stay `DRAFT` unless dispatched, so an identical undispatched request stays blocked until that order is handled. If orders cannot be read, nothing is created (handoff). |
 | Verification | Every planned write has a read-back contract (`execution/plan.py: VERIFICATION_CONTRACTS`); a tool without one is never planned. Only a verified step is reported as done. |
-| UNKNOWN outcomes | A timeout or exception after a write may have committed: the step is `UNKNOWN`, reconciled by read-back by idempotency key, never blindly retried. An operator can resolve it (`POST /runs/{id}/executions/{execution_id}/resolve`); success requires a verified record committed by that exact operation. History (`prior_*`, `resolution`) is never erased. |
+| UNKNOWN outcomes | A timeout or exception after a write may have committed: the step is `UNKNOWN`, reconciled by read-back by idempotency key, never blindly retried. An operator can resolve it (`POST /runs/{id}/executions/{execution_id}/resolve`); success requires a verified record committed by that exact operation. History (`prior_*`, `resolution`) is never erased. Repeating the same resolution is an idempotent no-op; a different one is refused (`CONFLICTING_RESOLUTION`). Resolution never runs the remaining steps and never closes the handoff. The audit's `reconciliation` section reports any mismatch between a recorded outcome and business state (`FAILED_BUT_RECORD_EXISTS`, `SUCCEEDED_BUT_RECORD_MISSING`, `UNKNOWN_BUT_RECORD_EXISTS`). |
+| Idempotency | Every planned write has a key `run-<run>:plan-<plan>:<tool>`. Repeating the same call returns the stored outcome; a key reused by a different tool or different arguments is refused (`IDEMPOTENCY_KEY_CONFLICT`) and nothing runs. A FAILED call is never re-invoked under its key; an UNKNOWN one only after read-back proves nothing was committed. Repeated `/approve` or `/confirm` requests return 409 and repeat nothing. |
 | Partial execution | Each step reports VERIFIED / FAILED / UNKNOWN / NOT_ATTEMPTED; runs end `COMPLETED`, `PARTIALLY_COMPLETED`, `FAILED` or `HANDOFF`. Nothing is rolled back and no rollback is claimed. Messages state record statuses (a DRAFT order reads as DRAFT). |
+| Authentication | `Authorization: Bearer <token>`, tokens from `VAANIFLOW_API_TOKENS`. Permissions: approve/reject → `OWNER`; confirm → `REQUESTER` or `OWNER`; resolve UNKNOWN and escalate (`/handoff`) → `OPERATOR`; read `/audit` → `AUDITOR`, `OPERATOR` or `OWNER`. No body field can name an actor (422). Every decision on a run, granted or denied, is in its audit `access` log. The orchestrator re-checks the permission itself. Instruction, read, search and sandbox routes are **not** authenticated (see below). |
+| CORS | Explicit origins only (default: local dashboard on port 3000); credentials off; a wildcard origin with credentials is refused at startup. |
+| Persistence | All state is in-memory (`SyntheticRepositories`) and lost on restart. ACT code depends only on the `RepositoryBundle` port (`application/ports/repositories.py`), so a persistent store can replace it. |
 | Business clock | Production uses the real clock. `VAANIFLOW_BUSINESS_CLOCK=synthetic` (or an ISO-8601 instant) pins the API to the synthetic dataset's 2026-10-17 12:00 IST for demos; the evaluation runner always uses it. |
+
+### Route authentication boundary
+
+Current behaviour, not a target state. Authorization is a global role check: runs are
+not bound to the principal who created them, so any `REQUESTER` can confirm any run and
+any `AUDITOR` can read any run's audit.
+
+| Class | Routes | Authentication |
+|---|---|---|
+| Protected | `POST /runs/{id}/approve`, `/reject` (`OWNER`); `/confirm` (`REQUESTER`/`OWNER`); `/executions/{execution_id}/resolve`, `/handoff` (`OPERATOR`); `GET /runs/{id}/audit` (`AUDITOR`/`OPERATOR`/`OWNER`) | Bearer token + permission, re-checked by the orchestrator |
+| Unauthenticated — instructions | `POST /runs` (with `text`), `POST /runs/{id}/process`, `POST /runs/{id}/clarify` | None |
+| Unauthenticated — reads | `GET /runs/{id}`, `GET /runs/{id}/trace`, `GET /runs/{id}/validation`, `GET /customers/search`, `/products/search`, `/quotes/search`, `/inventory/search` | None |
+| Sandbox / demo only | `GET /sandbox/scenarios`, `POST /sandbox/scenarios/{id}/run`, `POST /sandbox/evaluate-all` | None; scenarios run as the synthetic evaluation actor on fresh, isolated repositories |
+
+**Known security limitations (pending P3 hardening):**
+
+- **Instruction injection into an existing run.** The unauthenticated instruction routes
+  never execute anything by themselves — every write still needs an authenticated
+  `OWNER` to approve a specific approval. But an unauthenticated caller can send a new
+  instruction to any existing run: this supersedes the pending approval (the owner's
+  approval of it is then refused with 409) and creates a new plan and approval from the
+  caller's text, which an owner approving the run's current approval would execute. The
+  same call reopens a run that was escalated to a human (the handoff stays assigned) or
+  that already completed. History is preserved in the audit.
+- **Unauthenticated reads.** `/trace` contains the transcript and most of what
+  `/audit` protects; `GET /runs/{id}` and `/validation` expose run status and
+  validation results; the search routes expose (synthetic) customer, product, quote and
+  inventory data.
+- **Sandbox over HTTP.** The `/sandbox/*` routes are callable without a token and run
+  through the production orchestrator with the synthetic evaluation actor
+  (`SYNTHETIC_EVALUATION_OWNER`, `synthetic = true`) confirming and approving. They use
+  fresh repositories, so they cannot read or change the API's runs or business records.
+  They must not be exposed outside a demo environment.
 
 ### Next (not implemented)
 
-- Authentication and authorization of operators (identities are recorded, not verified)
+- Production identity: an identity provider with expiring, rotatable credentials
+  (today's static bearer tokens are a sandbox mechanism)
 - Persistent storage (all repositories are in-memory)
 - Operator dashboard, WhatsApp/telephony integrations
 - Text-to-speech responses (Gnani Timbre in the design)
@@ -653,8 +984,12 @@ Over synthetic, in-memory business data (`infrastructure/repositories/synthetic_
 - **Clarification replies are not merged**: `/clarify` takes a complete new instruction;
   the open clarification record (what was understood, what is missing) is preserved and
   superseded, but partial answers are not merged into the earlier request.
-- **No authentication**: approver, rejector, confirmer and resolver identities are
-  recorded claims.
+- **Sandbox authentication**: static bearer tokens from an environment variable, no
+  expiry, rotation, rate limiting or user management. The boundary (who may approve,
+  confirm, resolve, escalate, audit) is enforced; the credential store is not
+  production-grade. Instruction, read, search and sandbox routes are not authenticated,
+  and runs are not owner-isolated (see [Route authentication boundary](#route-authentication-boundary)).
+- **Not production-ready**: in-memory state, synthetic data, sandbox authentication.
 - **Relative dates**: only day offsets (kal/parso/…) are resolved; a spoken weekday or
   explicit date linked to a rate is treated as unresolved (clarification).
 - `numpy` is imported directly but is only installed transitively (via `scipy`).
@@ -676,7 +1011,7 @@ Over synthetic, in-memory business data (`infrastructure/repositories/synthetic_
 | [08 · Validation, policy, risk](System-Design/08-validation-policy-risk.md) | ACT: deterministic safeguards |
 | [09 · Execution & verification](System-Design/09-execution-verification.md) | ACT: approval, idempotency, read-back |
 | [16 · Development plan](System-Design/16-development-plan.md) | UNDERSTAND / ACT team split |
-| [18 · Architecture decisions](System-Design/18-architecture-decisions.md) | ADR-001 … ADR-018 |
+| [18 · Architecture decisions](System-Design/18-architecture-decisions.md) | ADR-001 … ADR-022 |
 | [20 · Gnani integration](System-Design/20-gnani-integration.md) | Provider adapter strategy |
 | [docs/architecture/understand-handoff.md](docs/architecture/understand-handoff.md) | UNDERSTAND → ACT handoff contract and consumer rules |
 
@@ -684,7 +1019,7 @@ The remaining design documents (agent orchestration, human handoff, sandbox, obs
 API contracts, security, frontend, demo scenarios, testing strategy, events, repository
 blueprint, state machines, agent reliability) are listed in
 [System-Design/README.md](System-Design/README.md). They describe intended behaviour;
-most of it is not implemented yet.
+parts of it (dashboard, events, TTS, production integrations) are not implemented yet.
 
 ---
 
