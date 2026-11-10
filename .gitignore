@@ -218,3 +218,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# VaaniFlow local runtime data
+#   Audio artifacts (e.g. Telegram voice notes) written by the voice pipeline.
+#   Default location; override with VAANIFLOW_ARTIFACT_DIR. Never commit them.
+artifacts/

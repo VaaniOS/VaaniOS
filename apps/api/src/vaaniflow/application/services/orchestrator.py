@@ -8,6 +8,7 @@ from uuid import UUID, uuid4
 
 from vaaniflow.application.schemas.asr import ASRInput
 from vaaniflow.application.schemas.audio_preprocessing import AudioPreprocessingInput
+from vaaniflow.application.services.clarification_merge import merge_clarification
 from vaaniflow.application.services.preprocess_audio import PreprocessAudioService
 from vaaniflow.application.services.transcribe_audio import TranscribeAudioService
 from vaaniflow.context.models.business_context import BusinessContext
@@ -27,6 +28,7 @@ from vaaniflow.domain.models.principal import (
     Role,
     require_permission,
 )
+from vaaniflow.domain.models.tax import TaxCalculation
 from vaaniflow.domain.models.tool_execution import ToolExecutionStatus
 from vaaniflow.domain.models.validation import ValidationResult, ValidationStatus
 from vaaniflow.domain.models.verification import VerificationStatus
@@ -34,6 +36,7 @@ from vaaniflow.domain.models.voice_run import VoiceRun, VoiceRunStatus
 from vaaniflow.domain.policies.decision import Decision, DecisionReasonCode, DecisionType
 from vaaniflow.domain.policies.risk import RiskAssessment
 from vaaniflow.domain.schemas.artifact import AudioArtifact
+from vaaniflow.domain.schemas.audio import AudioMetadata
 from vaaniflow.domain.schemas.common import Actionability
 from vaaniflow.domain.schemas.semantic import ReferenceType, SemanticState
 from vaaniflow.domain.schemas.transcript import Transcript
@@ -117,6 +120,8 @@ class WorkflowResult:
     confirmation: PendingConfirmation | None = None
     clarification: ClarificationRecord | None = None
     duplicate_check: DuplicateCheck | None = None
+    # The tax calculation the business rules produced for this assessment, if any.
+    tax_calculation: TaxCalculation | None = None
 
     @property
     def all_steps_verified(self) -> bool | None:
@@ -230,6 +235,31 @@ class VoiceWorkflowOrchestrator:
         returned as an approval request that must be approved via approve().
         """
         t = now or self.clock()
+        transcript = Transcript(
+            transcript_id=uuid4(),
+            provider="text",
+            language="hi-en",
+            text=text,
+            created_at=t,
+        )
+        return self.process_transcript(transcript=transcript, run_id=run_id, now=t)
+
+    def process_transcript(
+        self,
+        *,
+        transcript: Transcript,
+        run_id: UUID | None = None,
+        now: datetime | None = None,
+        semantic_state: SemanticState | None = None,
+        trace_note: str | None = None,
+        audio: AudioMetadata | None = None,
+    ) -> WorkflowResult:
+        """
+        Process one instruction transcript (typed text, ASR output, or a merged
+        clarification) through UNDERSTAND and ACT. Never executes a write.
+        ``semantic_state`` is given only for a merged clarification (ADR-023).
+        """
+        t = now or self.clock()
         run = self.repositories.runs.get_by_id(run_id=run_id) if run_id else None
         if run is None:
             run = self.start_run(run_id=run_id, now=t)
@@ -242,7 +272,15 @@ class VoiceWorkflowOrchestrator:
         superseded_confirmations = self._supersede_pending_confirmations(run, now=t)
         superseded_clarifications = self._supersede_open_clarifications(run, now=t)
 
-        result = self._process(text=text, run=run, now=t)
+        understand_result = self._understand(
+            transcript=transcript,
+            run=run,
+            now=t,
+            semantic_state=semantic_state,
+            trace_note=trace_note,
+            audio=audio,
+        )
+        result = self._proceed(run, understand_result, now=t)
         result.superseded_approval_ids = superseded
         result.superseded_confirmation_ids = superseded_confirmations
         result.superseded_clarification_ids = superseded_clarifications
@@ -276,11 +314,49 @@ class VoiceWorkflowOrchestrator:
                 clarification.superseded_by_transcript_id = transcript_id
                 self.repositories.clarifications.save(clarification=clarification)
 
-    def _process(self, *, text: str, run: VoiceRun, now: datetime) -> WorkflowResult:
-        t = now
+    def clarify(self, *, run_id: UUID, reply: str, now: datetime | None = None) -> WorkflowResult:
+        """
+        Answer the run's open clarification (ADR-023). A short reply is merged
+        into exactly the slots that were asked for and the merged request goes
+        through the full ACT pipeline; a reply naming actions is a new
+        instruction; a reply that answers nothing asked, or contradicts what was
+        understood, changes nothing. Callers authorize the principal first.
+        """
+        t = now or self.clock()
+        run = self.repositories.runs.get_by_id(run_id=run_id)
+        if run is None:
+            raise ApprovalFlowError("RUN_NOT_FOUND", f"Run {run_id} not found.")
+        open_clarifications = [
+            c
+            for c in self.repositories.clarifications.list_by_run(run_id=run.run_id)
+            if c.status is ClarificationStatus.OPEN
+        ]
+        if not open_clarifications:
+            return self.process_text(text=reply, run_id=run.run_id, now=t)
+        clarification = open_clarifications[-1]
+        outcome = merge_clarification(clarification, reply, compiler=self.compiler, now=t)
+        if outcome.kind == "instruction":
+            return self.process_text(text=reply, run_id=run.run_id, now=t)
+        if outcome.kind == "refused":
+            result = self._result(run, clarification.understand_result, message=outcome.message)
+            result.clarification = clarification
+            return result
+        assert outcome.transcript is not None and outcome.semantic_state is not None
+        return self.process_transcript(
+            transcript=outcome.transcript,
+            run_id=run.run_id,
+            now=t,
+            semantic_state=outcome.semantic_state,
+            trace_note=(
+                f"clarification {clarification.clarification_id} merged into "
+                f"{[s.value for s in outcome.filled_slots]}"
+            ),
+        )
 
-        # 1. UNDERSTAND
-        understand_result = self._understand(text=text, run=run, now=t)
+    def _proceed(
+        self, run: VoiceRun, understand_result: UnderstandResult, *, now: datetime
+    ) -> WorkflowResult:
+        t = now
         semantic_state = understand_result.semantic_state
         evaluation = understand_result.evaluation
 
@@ -553,6 +629,7 @@ class VoiceWorkflowOrchestrator:
             snapshot_version=plan.snapshot_version,
             plan=plan,
             duplicate_check=duplicate,
+            tax_calculation=act.context.tax_calculation,
         )
 
     # ------------------------------------------------------------------ #
@@ -1751,25 +1828,29 @@ class VoiceWorkflowOrchestrator:
     # Helpers
     # ------------------------------------------------------------------ #
 
-    def _understand(self, *, text: str, run: VoiceRun, now: datetime) -> UnderstandResult:
-        transcript = Transcript(
-            transcript_id=uuid4(),
-            provider="test",
-            language="hi-en",
-            text=text,
-            created_at=now,
-        )
+    def _understand(
+        self,
+        *,
+        transcript: Transcript,
+        run: VoiceRun,
+        now: datetime,
+        semantic_state: SemanticState | None = None,
+        trace_note: str | None = None,
+        audio: AudioMetadata | None = None,
+    ) -> UnderstandResult:
         run.transcript_id = transcript.transcript_id
         self.trace_service.record_stage(
             run_id=run.run_id,
             stage=TraceStage.TRANSCRIBED,
-            input_ref=f"text:{text[:60]}",
+            input_ref=trace_note or f"{transcript.provider}:{transcript.text[:60]}",
             output_summary=transcript.text,
-            confidence=0.98,
             timestamp=now,
         )
-        semantic_state = self.compiler.compile(transcript, run_id=run.run_id)
-        evaluation = self.evaluator.evaluate(semantic_state, transcript=transcript)
+        if semantic_state is None:
+            semantic_state = self.compiler.compile(transcript, run_id=run.run_id)
+        # Measured audio quality (voice input) gates actionability like the UNDERSTAND
+        # pipeline: unusable audio is BLOCKED.
+        evaluation = self.evaluator.evaluate(semantic_state, transcript=transcript, audio=audio)
         understand_result = UnderstandResult(
             result_id=uuid4(),
             run_id=run.run_id,
@@ -2074,6 +2155,7 @@ class VoiceWorkflowOrchestrator:
             plan=plan,
             executed_tools=executed or [],
             step_outcomes=steps or [],
+            tax_calculation=act.context.tax_calculation if act else None,
         )
 
     # ------------------------------------------------------------------ #
@@ -2087,13 +2169,14 @@ class VoiceWorkflowOrchestrator:
         run_id: UUID | None = None,
         now: datetime | None = None,
     ) -> WorkflowResult:
-        """Process an audio artifact by running preprocessor + ASR then delegating to pipeline."""
+        """Preprocess and transcribe an audio artifact, then process the real transcript."""
         t = now or self.clock()
-        run = self.start_run(run_id=run_id, now=t)
-        run.audio_artifact_id = artifact.artifact_id
-
         if not self.preprocess_audio_service or not self.transcribe_audio_service:
             raise RuntimeError("Audio services not configured on orchestrator.")
+        run = self.repositories.runs.get_by_id(run_id=run_id) if run_id else None
+        if run is None:
+            run = self.start_run(run_id=run_id, now=t)
+        run.audio_artifact_id = artifact.artifact_id
 
         processed = self.preprocess_audio_service.execute(
             request=AudioPreprocessingInput(
@@ -2109,5 +2192,6 @@ class VoiceWorkflowOrchestrator:
                 metadata=processed.metadata,
             )
         )
-
-        return self.process_text(text=transcript.text, run_id=run.run_id, now=t)
+        return self.process_transcript(
+            transcript=transcript, run_id=run.run_id, now=t, audio=processed.metadata
+        )

@@ -325,3 +325,13 @@ def test_non_scalar_provider_metadata_is_dropped():
     transcript = GnaniASRProvider(client=client).transcribe(request=_request(), audio=BytesIO(b"x"))
 
     assert "model" not in transcript.provider_metadata
+
+
+def test_from_environment_builds_the_sdk_client_inside_the_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vaaniflow.providers.gnani as gnani_module
+
+    monkeypatch.setattr(gnani_module, "GnaniSTTClient", FakeGnaniClient)
+    provider = GnaniASRProvider.from_environment()
+    assert isinstance(provider._client, FakeGnaniClient)

@@ -544,6 +544,9 @@ pytest -q
 | `VAANIFLOW_API_TOKENS` | Bearer tokens → principals for the API (see [Route authentication boundary](#route-authentication-boundary)). JSON map; tokens ≥ 16 characters; roles `OWNER`, `REQUESTER`, `OPERATOR`, `AUDITOR`. A malformed value fails when the app container is first created (the first request), not at import | **unset → every protected route answers 401** | `{"<token>": {"actor_id": "<uuid>", "name": "Ramesh", "roles": ["OWNER"]}}` |
 | `TELEGRAM_BOT_TOKEN` | Telegram bot token for the demo adapter; environment only, never logged | none (the bot does not start) | `<your bot token>` |
 | `TELEGRAM_PRINCIPALS` | Telegram allowlist: numeric user id → principal, same shape as `VAANIFLOW_API_TOKENS` (see [Telegram adapter (demo)](#telegram-adapter-demo)) | **unset → every Telegram user is refused** | `{"<telegram user id>": {"actor_id": "<uuid>", "name": "Demo Owner", "roles": ["OWNER"]}}` |
+| `VAANIFLOW_FFMPEG` | FFmpeg executable for Telegram voice notes | `ffmpeg` on PATH | `/usr/bin/ffmpeg` |
+| `VAANIFLOW_ASR_LANGUAGE` | Language code passed to the ASR adapter for voice notes (unverified for Hinglish, ADR-017) | adapter default (`en-IN`) | `hi-IN` |
+| `VAANIFLOW_ARTIFACT_DIR` | Where voice-note audio artifacts are stored (write-once, kept until deleted; `artifacts/` is git-ignored) | `artifacts` | `/tmp/vaaniflow-artifacts` |
 | `VAANIFLOW_BUSINESS_CLOCK` | Business clock: unset = real time; `synthetic` = the synthetic dataset's 2026-10-17 12:00 IST; or a timezone-aware ISO-8601 instant. Invalid values fail, never fall back | real clock | `synthetic` |
 
 ```bash
@@ -711,7 +714,7 @@ so the suite needs no credentials or network.
 pytest -q
 ```
 
-At the time of writing the suite collects and passes **575 tests**. No test needs
+At the time of writing the suite collects and passes **696 tests**. No test needs
 credentials or network access.
 
 What they prove, with exact-value assertions and checks on repository state rather than
@@ -739,6 +742,7 @@ on messages:
 | Authentication | `apps/api/tests/integration/test_auth_foundation.py`, `test_p3_authentication.py` | Token map, 401/403 on every run route, header/token-format/body impersonation, OWNER-only approval, recorded actors, run ownership, escalated/closed runs |
 | ACT safety regressions | `apps/api/tests/integration/test_act_safety.py`, `test_api_approval.py`, `test_p1_*.py`, `test_p2_hardening.py` | Actionability and negation gates, approval binding and supersession, temporal quote matching, quote validity, pricing authority, UNKNOWN outcomes and reconciliation, partial execution, verification, duplicate orders, confirmation, operator resolution, audit trail — asserting repository state |
 | ACT unit | `apps/api/tests/unit/{context,validation,policy,execution,handoff,evaluation,traces,infrastructure}/` | Resolvers, validation engine, policy matrix, tools, verifier, approvals, handoff, sandbox scenarios A–J |
+| Telegram | `apps/api/tests/integration/test_telegram_bot.py`, `test_telegram_auth.py`, `test_telegram_phase3.py` | Allowlist identity, ownership, callback integrity, secret redaction; cards and receipts derived from state; partial/UNKNOWN/handoff receipts; voice through the ASR boundary; FFmpeg errors; clarification merging; shared API/Telegram state; HTML injection; dynamic benchmark/status |
 | Safety regressions | `apps/api/tests/unit/semantic/test_safety_regressions.py` | Negation, product/customer/quantity/price alternatives, numeric fidelity, fallback products |
 
 Useful subsets:
@@ -965,20 +969,61 @@ Telegram user id ──► TELEGRAM_PRINCIPALS allowlist ──► Principal (ac
   errors are re-raised without the request URL, and the token is redacted from the
   adapter's and httpx's log records.
 
-Run it locally (synthetic identities only; never commit real ids or tokens):
+**What Telegram shows** is rendered from backend state only (`presentation/telegram_views.py`),
+with every dynamic value HTML-escaped:
+
+- **Approval card**: what was understood (customer, item, quantity, spoken price and its
+  source, tax instruction, time references, requested and negated actions, urgency), the
+  business records used (customer, product, quote and its validity, price used, stock,
+  tax rule and amounts), every validation check with its result, risk, the planned
+  operations in their real order, and unsupported actions that will be handed off.
+- **Receipt**: one line per planned step with its real status (`VERIFIED`, `FAILED`,
+  `UNKNOWN`, `NOT ATTEMPTED`). The header follows the run status: complete only when every
+  step is verified; *partially completed*; *outcome unknown* (with "no automatic retry");
+  *completed with handoff* when an unsupported action (e.g. WhatsApp) was not performed.
+  An expired approval shows an alert and no receipt.
+- **`/benchmark`** runs `EvaluationRunner().run_all()` and shows its actual result;
+  **`/status`** reads counts from the repositories. **`/demo`** sends the fixed canonical
+  instruction through the normal pipeline; its card is computed like any other.
+
+**Voice notes** (`application/services/voice_intake.py`): Telegram audio → FFmpeg
+(`infrastructure/audio/ffmpeg.py`: `VAANIFLOW_FFMPEG` or `ffmpeg` on PATH, 30 s timeout,
+pipes only) → 16 kHz mono PCM16 WAV → write-once ingest → preprocessing with measured
+quality → the Gnani ASR adapter → the same pipeline as text (unusable audio is blocked by
+Input Evaluation). Voice is enabled only when `GNANI_API_KEY` is set; otherwise voice notes
+are refused. Any conversion, ASR or empty-transcript failure is reported and creates no
+run; the caption and the demo text are never used instead. The live Gnani API has not been
+exercised by the automated tests (ADR-017).
+
+Voice processing writes local runtime artifacts: the converted original recording and the
+preprocessed 16 kHz WAV of every voice note, under `artifacts/` (relative to the working
+directory) or `VAANIFLOW_ARTIFACT_DIR`. They are kept until you delete them (prototype: no
+retention policy) and `artifacts/` is excluded from Git; never commit or share them.
+
+**Clarification replies** are merged (`application/services/clarification_merge.py`): a
+short reply such as "Sharma Builders" or "10 bag" fills only the slot the open
+clarification asked for (customer, product or quantity); everything already understood is
+kept; the merged request is re-evaluated and goes through context, validation and
+approval again. A reply naming actions is a new instruction; a reply that answers nothing
+asked, or changes another fact, changes nothing. The HTTP `/clarify` route uses the same
+merge.
+
+**One process, one state**: run the API and the bot together so both use the same
+application container (runs, approvals and audits are shared):
 
 ```bash
 export TELEGRAM_BOT_TOKEN='<your bot token>'
 export TELEGRAM_PRINCIPALS='{"<your numeric Telegram user id>": {"actor_id": "00000000-0000-4000-8000-00000000d001", "name": "Demo Owner", "roles": ["OWNER", "REQUESTER"]}}'
-python -m vaaniflow.presentation.telegram_bot
+export VAANIFLOW_API_TOKENS='{"demo-auditor-token-0001": {"actor_id": "00000000-0000-4000-8000-00000000a001", "name": "Auditor", "roles": ["AUDITOR"]}}'
+export VAANIFLOW_BUSINESS_CLOCK=synthetic   # the synthetic quotes are dated around 2026-10-17
+export GNANI_API_KEY='<optional: enables voice notes>'
+python -m vaaniflow.presentation.serve      # HTTP API on :8000 + Telegram bot
 ```
 
-Message the bot once without `TELEGRAM_PRINCIPALS` to learn your user id.
-
-Not implemented yet: voice notes are **not transcribed** (the bot uses the caption, or the
-canonical demo text); approval and execution messages are partly fixed text; state
-(runs, active-run per user) is in memory and lost on restart; the bot keeps its own
-in-memory repositories, separate from the HTTP API's.
+`python -m vaaniflow.presentation.telegram_bot` runs the bot alone (its own state). Message
+the bot once without `TELEGRAM_PRINCIPALS` to learn your user id. State is in memory and
+lost on restart; separate processes do not share state. Concurrent HTTP requests and bot
+updates share the in-memory repositories without locking (prototype).
 
 ### Next (not implemented)
 
@@ -1040,9 +1085,9 @@ in-memory repositories, separate from the HTTP API's.
 - **No catalog prices**: a customer without an applicable quote cannot be sold to by
   voice (ADR-019). `ACCEPTED` quotes are not treated as executable pricing because the
   model does not define their semantics.
-- **Clarification replies are not merged**: `/clarify` takes a complete new instruction;
-  the open clarification record (what was understood, what is missing) is preserved and
-  superseded, but partial answers are not merged into the earlier request.
+- **Clarification merging is slot-limited**: a short reply fills only a missing or
+  ambiguous customer, product or quantity of a single-item request; other gaps (price,
+  date, multiple items) need the complete corrected instruction.
 - **Sandbox authentication**: static bearer tokens from an environment variable, no
   expiry, rotation, rate limiting or user management. The permission and run-ownership
   boundary is enforced; the credential store is not production-grade. Search and sandbox
@@ -1069,7 +1114,7 @@ in-memory repositories, separate from the HTTP API's.
 | [08 · Validation, policy, risk](System-Design/08-validation-policy-risk.md) | ACT: deterministic safeguards |
 | [09 · Execution & verification](System-Design/09-execution-verification.md) | ACT: approval, idempotency, read-back |
 | [16 · Development plan](System-Design/16-development-plan.md) | UNDERSTAND / ACT team split |
-| [18 · Architecture decisions](System-Design/18-architecture-decisions.md) | ADR-001 … ADR-022 (ADR-022: authentication) |
+| [18 · Architecture decisions](System-Design/18-architecture-decisions.md) | ADR-001 … ADR-023 (ADR-022: authentication; ADR-023: Telegram presentation) |
 | [20 · Gnani integration](System-Design/20-gnani-integration.md) | Provider adapter strategy |
 | [docs/architecture/understand-handoff.md](docs/architecture/understand-handoff.md) | UNDERSTAND → ACT handoff contract and consumer rules |
 

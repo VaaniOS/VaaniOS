@@ -1,9 +1,19 @@
+"""
+Telegram adapter for VaaniFlow (presentation layer only).
+
+Identity: allowlisted Telegram users → Principals (``telegram_security``).
+State: by default the bot uses the same application container as the HTTP API
+(``api.dependencies.get_container``), so one process has one coherent state.
+Rendering: ``telegram_views`` projects actual backend state; nothing is fixed.
+Voice: Telegram audio → FFmpeg → WAV → ``VoiceIntakeService`` (ingest,
+preprocess, configured ASR provider) → the same pipeline as typed text.
+"""
+
 from __future__ import annotations
 
 import asyncio
 import logging
 import os
-import subprocess
 from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
@@ -13,9 +23,9 @@ import httpx
 from vaaniflow.application.services.orchestrator import (
     ApprovalFlowError,
     VoiceWorkflowOrchestrator,
-    WorkflowResult,
 )
 from vaaniflow.application.services.run_access import authorize_instruction
+from vaaniflow.application.services.voice_intake import VoiceIntakeError, VoiceIntakeService
 from vaaniflow.domain.models.approval import ApprovalStatus
 from vaaniflow.domain.models.principal import (
     AuthorizationError,
@@ -23,22 +33,21 @@ from vaaniflow.domain.models.principal import (
     Principal,
     require_permission,
 )
+from vaaniflow.domain.models.tool_execution import ToolExecutionStatus
 from vaaniflow.domain.models.voice_run import VoiceRunStatus
 from vaaniflow.evaluation.runner import EvaluationRunner
+from vaaniflow.infrastructure.audio.ffmpeg import AudioConversionError, convert_to_pcm16_wav
 from vaaniflow.infrastructure.repositories.synthetic_data import (
     SYNTHETIC_BUSINESS_TIME,
     SyntheticRepositories,
 )
+from vaaniflow.presentation import telegram_views as views
 from vaaniflow.presentation.telegram_security import (
     CallbackAction,
     TelegramIdentityProvider,
-    approve_data,
-    clarify_data,
-    confirm_data,
     install_token_redaction,
     parse_callback,
     redact,
-    reject_data,
 )
 
 logger = logging.getLogger("vaaniflow.telegram")
@@ -46,7 +55,7 @@ logger = logging.getLogger("vaaniflow.telegram")
 
 @dataclass(frozen=True)
 class TelegramUser:
-    """Telegram user model extracted from updates."""
+    """Telegram sender metadata. Never identity: only the allowlist maps users to principals."""
 
     user_id: int
     is_bot: bool
@@ -56,9 +65,6 @@ class TelegramUser:
     @property
     def display_name(self) -> str:
         return f"@{self.username}" if self.username else self.first_name
-
-    # A Telegram user id is an external identifier, not a VaaniFlow actor id or role.
-    # Only the explicit allowlist (TelegramIdentityProvider) turns it into a Principal.
 
 
 class TelegramAPIError(RuntimeError):
@@ -196,47 +202,8 @@ class TelegramClient:
         return response.content
 
 
-def convert_audio_to_pcm16_wav(audio_bytes: bytes) -> bytes:
-    """Convert any audio stream (Opus .oga, MP3, etc.) into 16kHz mono PCM WAV via FFmpeg."""
-    try:
-        cmd = [
-            "/usr/bin/ffmpeg",
-            "-y",
-            "-i",
-            "pipe:0",
-            "-ar",
-            "16000",
-            "-ac",
-            "1",
-            "-c:a",
-            "pcm_s16le",
-            "-f",
-            "wav",
-            "pipe:1",
-        ]
-        proc = subprocess.run(
-            cmd,
-            input=audio_bytes,
-            capture_output=True,
-            check=True,
-        )
-        return proc.stdout
-    except (subprocess.SubprocessError, OSError) as exc:
-        logger.warning(f"FFmpeg audio conversion failed: {exc}; returning raw bytes.")
-        return audio_bytes
-
-
 class VaaniFlowTelegramBot:
-    """
-    Production-grade Telegram Frontend Adapter for VaaniFlow.
-
-    Supports:
-    - Code-mixed voice notes (.oga / Opus) with audio normalization
-    - Deterministic compiler v2.0 claims extraction
-    - 8-point business validation and cryptographic plan snapshot locking
-    - Interactive inline buttons ([Approve Dispatch], [Clarify], [Reject])
-    - Authenticated owner execution with post-write read-back verification
-    """
+    """Telegram presentation adapter over the VaaniFlow application services."""
 
     CANONICAL_DEMO_TEXT = (
         "Arre Suresh, Sharma Builders ko turant 200 bag Ultratech cement dispatch karo. "
@@ -251,189 +218,46 @@ class VaaniFlowTelegramBot:
         repositories: SyntheticRepositories | None = None,
         client: TelegramClient | None = None,
         identity: TelegramIdentityProvider | None = None,
+        *,
+        container: Any | None = None,
+        voice_intake: VoiceIntakeService | None = None,
+        ffmpeg_executable: str | None = None,
+        evaluation_runner: EvaluationRunner | None = None,
     ) -> None:
+        """
+        By default the bot shares the HTTP API's application container (one state
+        per process). ``orchestrator``/``repositories`` are for isolated tests; a
+        bare ``repositories`` gets an orchestrator on the synthetic business clock.
+        """
         # Unset TELEGRAM_PRINCIPALS → nobody is allowlisted; malformed → raises here.
         self.identity = identity or TelegramIdentityProvider.from_env()
         self._token = token
         if len(token) >= 8:
             install_token_redaction(token)
-        self.repositories = repositories or SyntheticRepositories()
-        self.orchestrator = orchestrator or VoiceWorkflowOrchestrator(
-            repositories=self.repositories,
-            clock=lambda: SYNTHETIC_BUSINESS_TIME,
-        )
+        if orchestrator is None and repositories is None:
+            if container is None:
+                from vaaniflow.api.dependencies import get_container
+
+                container = get_container()
+            orchestrator = container.orchestrator
+            repositories = container.repositories
+        elif orchestrator is None:
+            assert repositories is not None
+            orchestrator = VoiceWorkflowOrchestrator(
+                repositories=repositories, clock=lambda: SYNTHETIC_BUSINESS_TIME
+            )
+        self.orchestrator: VoiceWorkflowOrchestrator = orchestrator
+        self.repositories = repositories or orchestrator.repositories
+        self.container = container
         self.client = client or TelegramClient(token=token)
+        self.voice_intake = voice_intake
+        self.ffmpeg_executable = ffmpeg_executable
+        self.evaluation_runner = evaluation_runner or EvaluationRunner()
         # Active run per authenticated principal (never per chat): in-memory only.
         self.active_runs: dict[UUID, UUID] = {}
-        # Track pending approval IDs per run
-        self.pending_approvals: dict[UUID, UUID] = {}
 
     # ------------------------------------------------------------------ #
-    # Message Builders (Dark Operator / Linear Aesthetic)
-    # ------------------------------------------------------------------ #
-
-    def format_workflow_card(
-        self, result: WorkflowResult, transcript_text: str
-    ) -> tuple[str, dict[str, Any] | None]:
-        """Format an execution or approval card for Telegram."""
-        run_id_short = str(result.run.run_id)[:8]
-        status = result.run.status.value
-
-        if result.run.status is VoiceRunStatus.APPROVAL_REQUIRED and result.approval:
-            self.pending_approvals[result.run.run_id] = result.approval.approval_id
-            plan = result.plan
-            snap = result.snapshot_version or "N/A"
-
-            # Extract pricing & items
-            items_desc = "• 200 bags UltraTech Cement 50kg (₹420.00/bag)"
-            total_desc = "Subtotal: ₹84,000.00 + 28% GST (₹23,520) = <b>₹1,07,520.00</b>"
-            if plan and plan.tool_calls:
-                for tc in plan.tool_calls:
-                    if tc.tool_name == "create_invoice_draft":
-                        args = tc.arguments
-                        subtotal_val = args.get("subtotal", "84000.00")
-                        tax_val = args.get("tax_total", "23520.00")
-                        total_val = args.get("total", "107520.00")
-                        try:
-                            fmt_total = f"₹{float(total_val):,.2f}"
-                        except (ValueError, TypeError):
-                            fmt_total = f"₹{total_val}"
-                        total_desc = (
-                            f"Subtotal: ₹{subtotal_val} + GST: ₹{tax_val} = <b>{fmt_total} INR</b>"
-                        )
-
-            risk_score = result.risk_assessment.score if result.risk_assessment else 0.37
-            risk_level = result.risk_assessment.level.value if result.risk_assessment else "HIGH"
-
-            text = (
-                f"⚡ <b>VaaniFlow — Approval Required</b>\n"
-                f"<code>Run: {run_id_short} | Snapshot: {snap}</code>\n\n"
-                f"🗣 <b>Spoken Instruction:</b>\n"
-                f'<i>"{transcript_text}"</i>\n\n'
-                f"📦 <b>Grounded Execution Plan:</b>\n"
-                f"• <b>Customer:</b> Sharma Builders <code>(CUST-001)</code>\n"
-                f"• <b>Items:</b> {items_desc}\n"
-                f"• <b>Financials:</b> {total_desc}\n"
-                f"• <b>Delivery:</b> Site 12, Outer Ring Road, Peenya\n\n"
-                f"🛡 <b>Safety & Validation:</b>\n"
-                f"• 8/8 Deterministic Checks: <b>PASSED ✅</b>\n"
-                f"• Risk Score: <b>{risk_score:.2f} ({risk_level})</b>\n"
-                f"• Gate: <i>Irreversible physical dispatch requires owner approval.</i>"
-            )
-
-            markup = {
-                "inline_keyboard": [
-                    [
-                        {
-                            "text": "✅ Approve Dispatch (₹1,07,520)",
-                            "callback_data": approve_data(
-                                result.run.run_id, result.approval.approval_id
-                            ),
-                        }
-                    ],
-                    [
-                        {
-                            "text": "❓ Clarify Instruction",
-                            "callback_data": clarify_data(result.run.run_id),
-                        },
-                        {
-                            "text": "❌ Reject",
-                            "callback_data": reject_data(
-                                result.run.run_id, result.approval.approval_id
-                            ),
-                        },
-                    ],
-                ]
-            }
-            return text, markup
-
-        if result.run.status is VoiceRunStatus.CLARIFICATION_REQUIRED and result.clarification:
-            reason = result.clarification.reason
-            understood = (
-                ", ".join(f"{k}: {v}" for k, v in result.clarification.understood.items()) or "none"
-            )
-            unresolved = (
-                ", ".join(
-                    str(u.get("field") or u.get("slot") or u.get("reason") or u)
-                    for u in result.clarification.unresolved
-                )
-                or "parameters"
-            )
-            text = (
-                f"❓ <b>Clarification Required</b>\n"
-                f"<code>Run: {run_id_short} | Status: CLARIFICATION_REQUIRED</code>\n\n"
-                f"⚠️ <b>Ambiguity Detected:</b> {reason}\n"
-                f"• Understood slots: <code>{understood}</code>\n"
-                f"• Unresolved items: <b>{unresolved}</b>\n\n"
-                f"<i>Please reply directly with your correction or missing details.</i>"
-            )
-            return text, None
-
-        if result.run.status is VoiceRunStatus.HANDOFF:
-            reason = (
-                result.decision.reason
-                if result.decision
-                else "Operational constraint triggered handoff."
-            )
-            text = (
-                f"🛑 <b>Human Handoff Escalation</b>\n"
-                f"<code>Run: {run_id_short} | Status: HANDOFF</code>\n\n"
-                f"<b>Reason:</b> {reason}\n"
-                f"<i>The system blocked automated execution to preserve business invariants. A human operator has been notified.</i>"
-            )
-            return text, None
-
-        # Fallback executed or completed
-        text = (
-            f"ℹ️ <b>Workflow Status: {status}</b>\n"
-            f"<code>Run: {run_id_short}</code>\n"
-            f"<b>Message:</b> {result.message}"
-        )
-        if result.run.status is VoiceRunStatus.CONFIRMATION_REQUIRED and result.confirmation:
-            confirm_markup = {
-                "inline_keyboard": [
-                    [
-                        {"text": "Yes", "callback_data": confirm_data(result.run.run_id, "yes")},
-                        {"text": "No", "callback_data": confirm_data(result.run.run_id, "no")},
-                    ]
-                ]
-            }
-            return text, confirm_markup
-        return text, None
-
-    def format_approved_card(
-        self,
-        result: WorkflowResult,
-        approver: Principal,
-    ) -> str:
-        """Format verified post-approval execution receipt."""
-        run_id_short = str(result.run.run_id)[:8]
-        snap = result.snapshot_version or "4eb7ab8ba6e18876"
-
-        steps_lines = []
-        for step in result.step_outcomes:
-            v_status = step.verification_status or "VERIFIED"
-            steps_lines.append(
-                f"• <b>{step.tool_name}</b>: <code>{str(step.entity_id)[:8] if step.entity_id else 'OK'}</code> — "
-                f"<b>{v_status} ✅</b>"
-            )
-        steps_text = (
-            "\n".join(steps_lines) if steps_lines else "• All actions committed and verified."
-        )
-
-        return (
-            f"✅ <b>Order Approved &amp; Executed</b>\n"
-            f"<code>Run: {run_id_short} | Snapshot Verified: {snap}</code>\n"
-            f"<b>Authorized by:</b> {approver.display_name} "
-            f"[{', '.join(r.value for r in approver.roles)}] via {approver.authentication_method}\n\n"
-            f"📦 <b>Verified Business Records:</b>\n"
-            f"{steps_text}\n\n"
-            f"🛡 <b>Post-Write Audit:</b> Read-Back Verification passed for 3/3 records.\n"
-            f"🔒 <b>Idempotency Key:</b> Replay-protected against duplicate truck dispatches."
-        )
-
-    # ------------------------------------------------------------------ #
-    # Update Dispatcher & Handlers
+    # Update dispatch and error boundary
     # ------------------------------------------------------------------ #
 
     async def handle_update(self, update: dict[str, Any]) -> None:
@@ -497,6 +321,13 @@ class VaaniFlowTelegramBot:
     def _refusal(error: AuthorizationError | ApprovalFlowError) -> str:
         return f"⛔ Not done ({error.code}): {error.message}"
 
+    async def _send(self, chat_id: int, text: str, markup: dict[str, Any] | None = None) -> None:
+        await self.client.send_message(chat_id, text, reply_markup=markup)
+
+    # ------------------------------------------------------------------ #
+    # Messages
+    # ------------------------------------------------------------------ #
+
     async def _handle_message(self, message: dict[str, Any]) -> None:
         chat = message.get("chat") or {}
         chat_id = chat.get("id")
@@ -504,7 +335,7 @@ class VaaniFlowTelegramBot:
             return
         principal, reason = self._authenticate(chat, message.get("from") or {})
         if principal is None:
-            await self.client.send_message(chat_id, f"⛔ {reason}")
+            await self._send(chat_id, f"⛔ {views.esc(reason)}")
             return
 
         text = (message.get("text") or "").strip()
@@ -522,44 +353,69 @@ class VaaniFlowTelegramBot:
         try:
             require_permission(principal, Permission.SUBMIT_INSTRUCTION)
         except AuthorizationError as error:
-            await self.client.send_message(chat_id, self._refusal(error))
+            await self._send(chat_id, views.esc(self._refusal(error)))
             return
 
         if text.startswith("/demo"):
             await self._run_demo(chat_id, principal)
             return
+        if "voice" in message or "audio" in message:
+            await self._handle_voice(chat_id, principal, message.get("voice") or message["audio"])
+            return
+        if text:
+            await self._instruct(chat_id, principal, text, new_run=False)
 
-        # 1. Voice Note Intake
-        if "voice" in message:
-            voice_meta = message["voice"]
-            file_id = voice_meta["file_id"]
-            duration = voice_meta.get("duration", 0)
-
-            await self.client.send_message(
+    async def _handle_voice(self, chat_id: int, principal: Principal, voice: Any) -> None:
+        """Telegram audio → WAV → ASR → the same pipeline as text. Nothing is substituted."""
+        if self.voice_intake is None:
+            await self._send(
                 chat_id,
-                f"🎙️ <i>Received {duration}s voice note. Normalizing 16kHz audio & transcribing via Gnani ASR...</i>",
+                "🎙️ Voice notes are not available: no speech-to-text provider is configured "
+                "(set <code>GNANI_API_KEY</code>). Please type the instruction instead.",
             )
-
-            # Download Telegram voice audio
-            file_info = await self.client.get_file(file_id)
-            file_path = file_info.get("file_path", "")
-            raw_oga_bytes = await self.client.download_file(file_path)
-            _ = convert_audio_to_pcm16_wav(raw_oga_bytes)
-
-            # In production, pass WAV to Gnani STT; if caption provided or demo utterance, use it
-            spoken_text = message.get("caption") or self.CANONICAL_DEMO_TEXT
-            await self._instruct(chat_id, principal, spoken_text, new_run=True)
             return
-
-        # 2. Text Message Intake
-        if not text:
+        file_id = voice.get("file_id") if isinstance(voice, dict) else None
+        if not isinstance(file_id, str):
+            await self._send(chat_id, "🎙️ That voice note could not be read.")
             return
-        await self._instruct(chat_id, principal, text, new_run=False)
+        file_info = await self.client.get_file(file_id)
+        raw = await self.client.download_file(str(file_info.get("file_path", "")))
+        try:
+            wav = await asyncio.to_thread(
+                convert_to_pcm16_wav, raw, executable=self.ffmpeg_executable
+            )
+            voice_transcript = await asyncio.to_thread(
+                self.voice_intake.transcribe_wav, wav, now=self.orchestrator.clock()
+            )
+        except (AudioConversionError, VoiceIntakeError) as error:
+            logger.info("Voice note not transcribed: %s", error.code)
+            await self._send(
+                chat_id,
+                f"🎙️ The voice note was not processed ({views.esc(error.code)}): "
+                f"{views.esc(error.message)} Nothing was done.",
+            )
+            return
+        transcript = voice_transcript.transcript
+        await self._send(
+            chat_id,
+            f"🎙️ Transcribed by <code>{views.esc(transcript.provider)}</code>:\n"
+            f"<i>{views.esc(transcript.text, 500)}</i>",
+        )
+        run = self.orchestrator.start_run(owner_id=principal.principal_id)
+        self.active_runs[principal.principal_id] = run.run_id
+        result = self.orchestrator.process_transcript(
+            transcript=transcript, run_id=run.run_id, audio=voice_transcript.audio
+        )
+        text, markup = views.render_workflow(result, transcript.text)
+        await self._send(chat_id, text, markup)
 
     async def _instruct(
         self, chat_id: int, principal: Principal, text: str, *, new_run: bool
     ) -> None:
-        """Send an instruction to the principal's own open run, or to a new run they own."""
+        """
+        Send text to the principal's own open run, or to a new run they own. A run
+        waiting for a clarification gets the reply merged into what was asked.
+        """
         run = None
         active_run_id = None if new_run else self.active_runs.get(principal.principal_id)
         if active_run_id is not None:
@@ -569,46 +425,47 @@ class VaaniFlowTelegramBot:
                 authorize_instruction(principal, run)
             except AuthorizationError as error:
                 if error.code not in {"RUN_CLOSED", "RUN_ESCALATED"}:
-                    await self.client.send_message(chat_id, self._refusal(error))
+                    await self._send(chat_id, views.esc(self._refusal(error)))
                     return
                 # A settled or escalated run is never reopened: start a new one.
                 run = None
-            else:
-                await self.client.send_message(
-                    chat_id,
-                    f"🔄 <i>Applying instruction to active run <code>{str(run.run_id)[:8]}</code>...</i>",
-                )
         if run is None:
-            run = self.orchestrator.start_run(
-                owner_id=principal.principal_id, now=SYNTHETIC_BUSINESS_TIME
-            )
-        self.active_runs[principal.principal_id] = run.run_id
-        result = self.orchestrator.process_text(
-            text=text, run_id=run.run_id, now=SYNTHETIC_BUSINESS_TIME
-        )
-        card_text, markup = self.format_workflow_card(result, text)
-        await self.client.send_message(chat_id, card_text, reply_markup=markup)
+            run = self.orchestrator.start_run(owner_id=principal.principal_id)
+            self.active_runs[principal.principal_id] = run.run_id
+            result = self.orchestrator.process_text(text=text, run_id=run.run_id)
+        else:
+            self.active_runs[principal.principal_id] = run.run_id
+            result = self.orchestrator.clarify(run_id=run.run_id, reply=text)
+        transcript = result.understand_result.transcript.text if result.understand_result else text
+        card, markup = views.render_workflow(result, transcript)
+        await self._send(chat_id, card, markup)
 
     async def _send_welcome(self, chat_id: int, principal: Principal) -> None:
+        voice = "available" if self.voice_intake else "not configured"
         welcome = (
-            f"👋 <b>Welcome to VaaniFlow, {principal.display_name}!</b>\n\n"
-            f"VaaniFlow is a <b>deterministic voice-to-action engine</b> for wholesale distributor yards.\n\n"
-            f"<b>How to use:</b>\n"
-            f"1. 🎙️ <b>Send a Voice Note:</b> Tap the mic and speak in Hinglish or English.\n"
-            f'2. ✍️ <b>Type an instruction:</b> e.g. <i>"Sharma Builders ko 200 bag cement bhejo parso ke rate pe"</i>\n'
-            f"3. 🧪 <b>Tap /demo:</b> Run the canonical Ramesh voice note demo instantly.\n"
-            f"4. 📊 <b>Tap /benchmark:</b> Inspect the 10/10 automated evaluation scorecard."
+            f"👋 <b>Welcome to VaaniFlow, {views.esc(principal.display_name)}!</b>\n\n"
+            "Send an instruction in Hinglish or English. VaaniFlow resolves it against "
+            "business records, validates it and asks for approval before anything is "
+            "executed.\n\n"
+            f"• 🎙️ Voice notes: {voice}\n"
+            "• 🧪 /demo: run the canonical demo instruction through the real pipeline\n"
+            "• 📊 /benchmark: run the evaluation scenarios now\n"
+            "• ℹ️ /status: current in-memory state"
         )
         markup = {
             "inline_keyboard": [
-                [{"text": "🧪 Run Canonical Demo", "callback_data": "cmd:demo"}],
+                [{"text": "🧪 Run demo instruction", "callback_data": "cmd:demo"}],
                 [
-                    {"text": "📊 Evaluation Lab (A-J)", "callback_data": "cmd:bench"},
-                    {"text": "ℹ️ System Status", "callback_data": "cmd:status"},
+                    {"text": "📊 Evaluation", "callback_data": "cmd:bench"},
+                    {"text": "ℹ️ Status", "callback_data": "cmd:status"},
                 ],
             ]
         }
-        await self.client.send_message(chat_id, welcome, reply_markup=markup)
+        await self._send(chat_id, welcome, markup)
+
+    # ------------------------------------------------------------------ #
+    # Callbacks
+    # ------------------------------------------------------------------ #
 
     async def _handle_callback(self, query: dict[str, Any]) -> None:
         query_id = query.get("id")
@@ -664,12 +521,10 @@ class VaaniFlowTelegramBot:
         if parsed.action == "approve":
             assert parsed.approval_id is not None
             # The orchestrator enforces APPROVE (OWNER), the approval↔run binding and
-            # that the approval is still pending against current state.
+            # that the approval is still pending against current state. Nothing is
+            # shown as approved before it returns.
             result = self.orchestrator.approve(
-                run_id=parsed.run_id,
-                approval_id=parsed.approval_id,
-                actor=principal,
-                now=SYNTHETIC_BUSINESS_TIME,
+                run_id=parsed.run_id, approval_id=parsed.approval_id, actor=principal
             )
             if result.approval is None or result.approval.status is not ApprovalStatus.APPROVED:
                 # Stale against current state (e.g. the business snapshot changed and the
@@ -677,26 +532,22 @@ class VaaniFlowTelegramBot:
                 await self.client.answer_callback_query(query_id, result.message, show_alert=True)
                 return
             await self.client.answer_callback_query(query_id, "Approval recorded.")
+            receipt = views.render_receipt(result, approver=principal)
             if isinstance(message_id, int):
-                await self.client.edit_message_text(
-                    chat_id, message_id, self.format_approved_card(result, principal)
-                )
+                await self.client.edit_message_text(chat_id, message_id, receipt)
+            else:
+                await self._send(chat_id, receipt)
             return
 
         if parsed.action == "reject":
             assert parsed.approval_id is not None
             self.orchestrator.reject(
-                run_id=parsed.run_id,
-                approval_id=parsed.approval_id,
-                actor=principal,
-                now=SYNTHETIC_BUSINESS_TIME,
+                run_id=parsed.run_id, approval_id=parsed.approval_id, actor=principal
             )
             await self.client.answer_callback_query(query_id, "Plan rejected.")
             if isinstance(message_id, int):
                 await self.client.edit_message_text(
-                    chat_id,
-                    message_id,
-                    f"❌ <b>Execution Plan Rejected</b>\n<code>Run: {str(parsed.run_id)[:8]}</code>\n<i>Rejected by {principal.display_name}. No database writes were committed.</i>",
+                    chat_id, message_id, views.render_rejection(parsed.run_id, principal)
                 )
             return
 
@@ -705,14 +556,11 @@ class VaaniFlowTelegramBot:
             # The orchestrator enforces CONFIRM, run ownership and that the
             # confirmation is still pending; a stale reply changes nothing.
             result = self.orchestrator.confirm(
-                run_id=parsed.run_id,
-                reply=parsed.reply,
-                actor=principal,
-                now=SYNTHETIC_BUSINESS_TIME,
+                run_id=parsed.run_id, reply=parsed.reply, actor=principal
             )
             await self.client.answer_callback_query(query_id)
-            card_text, markup = self.format_workflow_card(result, result.message)
-            await self.client.send_message(chat_id, card_text, reply_markup=markup)
+            card, markup = views.render_workflow(result, "")
+            await self._send(chat_id, card, markup)
             return
 
         # clarify: the callback's run id is untrusted; the shared run rules decide.
@@ -722,61 +570,74 @@ class VaaniFlowTelegramBot:
         authorize_instruction(principal, run)
         self.active_runs[principal.principal_id] = run.run_id
         await self.client.answer_callback_query(query_id)
-        await self.client.send_message(
+        await self._send(
             chat_id,
-            f"✍️ <i>Please send your clarification or correction for run <code>{str(run.run_id)[:8]}</code> (e.g. 'actually 220 bags' or 'cancel dispatch').</i>",
+            f"✍️ <i>Please send your clarification for run <code>{views.short(run.run_id)}</code>: "
+            "the complete corrected instruction. It replaces the pending plan; nothing "
+            "executes without a new approval.</i>",
         )
-
-    async def _run_demo(self, chat_id: int, principal: Principal) -> None:
-        """Run the canonical Hinglish demo voice instruction as the principal's new run."""
-        demo_text = self.CANONICAL_DEMO_TEXT
-        await self.client.send_message(
-            chat_id,
-            f'🎙️ <i>Simulating incoming WhatsApp voice note from Yard Owner...</i>\n\n<i>"{demo_text}"</i>',
-        )
-        await self._instruct(chat_id, principal, demo_text, new_run=True)
-
-    async def _run_benchmark(self, chat_id: int) -> None:
-        """Run the evaluation suite across all 10 canonical failure scenarios."""
-        runner = EvaluationRunner()
-        suite = runner.run_all()
-
-        rows = []
-        for r in suite.results:
-            tag = "✅ PASS" if r.passed else "❌ FAIL"
-            rows.append(f"• <code>{r.scenario_id.value[:18]}</code>: <b>{tag}</b>")
-        rows_text = "\n".join(rows)
-
-        bench_msg = (
-            f"📊 <b>Evaluation Benchmark Suite (A–J)</b>\n\n"
-            f"• <b>Scenarios Passed:</b> <b>{suite.passed_scenarios} / {suite.total_scenarios}</b> (100%)\n"
-            f"• <b>False Execution Rate:</b> <b>{suite.false_execution_rate * 100:.1f}%</b> (0 unverified writes)\n"
-            f"• <b>False Confirmation Rate:</b> <b>{suite.false_confirmation_rate * 100:.1f}%</b>\n"
-            f"• <b>Pytest Tests:</b> <b>526 PASSED</b>\n\n"
-            f"<b>Canonical Results:</b>\n"
-            f"{rows_text}"
-        )
-        await self.client.send_message(chat_id, bench_msg)
-
-    async def _run_status(self, chat_id: int) -> None:
-        """Report live backend status."""
-        orders_cnt = len(self.repositories.orders.list_all())
-        quotes_cnt = len(self.repositories.quotes.list_all())
-        inventory_cnt = len(self.repositories.inventory.list_all())
-
-        status_msg = (
-            f"ℹ️ <b>VaaniFlow System Status</b>\n\n"
-            f"• <b>Engine:</b> Deterministic Semantic Compiler v2.0\n"
-            f"• <b>Synthetic Clock:</b> <code>{SYNTHETIC_BUSINESS_TIME.isoformat()}</code>\n"
-            f"• <b>Active Catalog:</b> 1 Customer, 1 Product, 1 Warehouse\n"
-            f"• <b>Live Database:</b> {orders_cnt} Orders, {quotes_cnt} Quotes, {inventory_cnt} Stock Pools\n"
-            f"• <b>Active Security:</b> Principal RBAC (Owner-locked) + TOCTOU Snapshot Protection\n"
-            f"• <b>Status:</b> 🟢 All Systems Nominal"
-        )
-        await self.client.send_message(chat_id, status_msg)
 
     # ------------------------------------------------------------------ #
-    # Long Polling Main Loop
+    # Commands
+    # ------------------------------------------------------------------ #
+
+    async def _run_demo(self, chat_id: int, principal: Principal) -> None:
+        """The canonical demo instruction (a fixed input) through the real pipeline."""
+        await self._send(
+            chat_id,
+            "🧪 <i>Demo instruction (fixed input; everything below is computed):</i>\n"
+            f"<i>{views.esc(self.CANONICAL_DEMO_TEXT, 500)}</i>",
+        )
+        await self._instruct(chat_id, principal, self.CANONICAL_DEMO_TEXT, new_run=True)
+
+    async def _run_benchmark(self, chat_id: int) -> None:
+        """Run the evaluation suite now (isolated repositories) and show its real result."""
+        suite = await asyncio.to_thread(self.evaluation_runner.run_all)
+        await self._send(chat_id, views.render_benchmark(suite))
+
+    def status_facts(self) -> dict[str, Any]:
+        """Counts and configuration of this process, read from the repositories."""
+        repos = self.repositories
+        runs = repos.runs.list_all()
+        approvals = [
+            approval
+            for run in runs
+            for pending in repos.pending_executions.list_by_run(run_id=run.run_id)
+            if (approval := repos.approvals.get_by_id(approval_id=pending.approval_id))
+        ]
+        executions = [
+            e for run in runs for e in repos.tool_executions.list_by_run(run_id=run.run_id)
+        ]
+        clock_source = getattr(self.container, "business_clock_source", "injected")
+        by_status: dict[str, int] = {}
+        for run in runs:
+            by_status[run.status.value] = by_status.get(run.status.value, 0) + 1
+        return {
+            "Business clock": f"{self.orchestrator.clock().isoformat()} ({clock_source})",
+            "Runs": len(runs),
+            "Runs by status": ", ".join(f"{k} {v}" for k, v in sorted(by_status.items())) or "none",
+            "Approvals pending": sum(a.status is ApprovalStatus.REQUESTED for a in approvals),
+            "Approvals approved": sum(a.status is ApprovalStatus.APPROVED for a in approvals),
+            "Tool executions": len(executions),
+            "UNKNOWN outcomes": sum(e.status is ToolExecutionStatus.UNKNOWN for e in executions),
+            "Orders / invoices / dispatches": (
+                f"{len(repos.orders.list_all())} / {len(repos.invoices.list_all())} / "
+                f"{len(repos.dispatches.list_all())}"
+            ),
+            "Runs handed to an operator": sum(r.status is VoiceRunStatus.HANDOFF for r in runs),
+            "Customers / products / quotes": (
+                f"{len(repos.customers.list_all())} / {len(repos.products.list_all())} / "
+                f"{len(repos.quotes.list_all())}"
+            ),
+            "Speech-to-text": "configured" if self.voice_intake else "not configured",
+            "WhatsApp / notifications": "not supported (handed to an operator)",
+        }
+
+    async def _run_status(self, chat_id: int) -> None:
+        await self._send(chat_id, views.render_status(self.status_facts()))
+
+    # ------------------------------------------------------------------ #
+    # Long polling
     # ------------------------------------------------------------------ #
 
     async def start_polling(self) -> None:
@@ -808,8 +669,28 @@ class VaaniFlowTelegramBot:
                 await self.handle_update(update)  # never raises (per-update boundary)
 
 
+def voice_intake_from_env(environ: dict[str, str] | None = None) -> VoiceIntakeService | None:
+    """Gnani ASR when GNANI_API_KEY is set; otherwise None (voice notes are refused)."""
+    env = environ if environ is not None else dict(os.environ)
+    if not env.get("GNANI_API_KEY", "").strip():
+        return None
+    from pathlib import Path
+
+    from vaaniflow.audio import LocalAudioPreprocessor
+    from vaaniflow.infrastructure.storage.local import LocalArtifactStorage
+    from vaaniflow.providers.gnani import GnaniASRProvider
+
+    storage = LocalArtifactStorage(Path(env.get("VAANIFLOW_ARTIFACT_DIR", "artifacts")))
+    return VoiceIntakeService(
+        artifact_storage=storage,
+        audio_preprocessor=LocalAudioPreprocessor(),
+        asr_provider=GnaniASRProvider.from_environment(),
+        language_hint=env.get("VAANIFLOW_ASR_LANGUAGE") or None,
+    )
+
+
 async def run_bot() -> None:
-    """Entry point for running the bot via CLI."""
+    """Entry point: the Telegram bot only (its own process state)."""
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         print("❌ Error: TELEGRAM_BOT_TOKEN environment variable is not set.")
@@ -823,7 +704,7 @@ async def run_bot() -> None:
     if not identity.has_principals:
         print("⚠️ TELEGRAM_PRINCIPALS is not set: every Telegram user will be refused.")
 
-    bot = VaaniFlowTelegramBot(token=token, identity=identity)
+    bot = VaaniFlowTelegramBot(token=token, identity=identity, voice_intake=voice_intake_from_env())
     try:
         await bot.start_polling()
     finally:

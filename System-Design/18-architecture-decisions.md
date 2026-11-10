@@ -186,7 +186,7 @@ Decision:
 2. A CONFIRM decision creates a confirmation bound to its run, the exact warnings (`check_type|field|expected|actual`) and the business snapshot. A reply is classified deterministically as yes / no / unclear; only "yes" to a still-pending confirmation of the same run accepts exactly those warnings, and approval is still required afterwards. Changed facts expire it; a new instruction supersedes it.
 3. An UNKNOWN execution can be resolved by an operator only for the exact run, execution and attempt. SUCCEEDED requires a record stamped with that operation's idempotency key that passes read-back verification; FAILED is refused if such a record exists. The UNKNOWN history (`prior_*`) and the resolution (`resolution`, `resolved_by`, `resolved_at`, `resolution_reason`) are kept on the execution. Resolution never runs the remaining steps.
 4. Approvals record run, plan id and fingerprint, requested and approval-time snapshots, actors, timestamps, rejection and expiry reasons, `superseded_by`, and the records the plan produced. No identity is fabricated. (Superseded for identity by ADR-022: actors are now authenticated principals.)
-5. Clarifications are persisted with what was understood and what is unresolved (evaluation reasons, ambiguities with candidates, failed checks); a new instruction supersedes them. Partial replies are not merged into the earlier request.
+5. Clarifications are persisted with what was understood and what is unresolved (evaluation reasons, ambiguities with candidates, failed checks); a new instruction supersedes them. (Partial replies: see ADR-023.)
 
 Reason:
 Technical idempotency prevents a retried call from writing twice, not a second identical request from creating a second order. A "yes" must never approve something other than what was shown, an operator must not be able to declare success for a write that never happened, and the audit trail must answer what was approved, by whom, and what actually happened.
@@ -203,3 +203,14 @@ Decision:
 
 Reason:
 Identity asserted by a caller (a header, a role-named token, a body field) is not authentication, and an approval recorded under such an identity proves nothing. One model, enforced at the API and again in the orchestrator, keeps every adapter on the same rules. Static tokens are a sandbox credential store; the `IdentityProvider` boundary lets a real identity provider replace it.
+
+## ADR-023 — Telegram as a truthful projection of application state
+
+Decision:
+1. Telegram renders only what the backend returned (`presentation/telegram_views.py`): approval cards from the run's SemanticState, BusinessContext, validation checks, risk, tax calculation and plan; receipts from per-step `StepStatus` with headers derived from the run status (complete only when every step is VERIFIED; partial, UNKNOWN and handoff stated explicitly); benchmark and status from the evaluation runner and repositories. Every dynamic value is HTML-escaped.
+2. The bot uses the API's application container by default; `python -m vaaniflow.presentation.serve` runs both in one process so runs, approvals and audits are shared. State stays in memory (prototype).
+3. Voice notes go Telegram audio → FFmpeg (configurable executable, timeout, sanitized errors) → write-once ingest → preprocessing → the configured ASR adapter → `process_transcript`, which keeps the provider's transcript and feeds measured audio quality to Input Evaluation. A failure at any stage creates no run; no other text is ever substituted.
+4. A clarification reply is compiled by the unchanged UNDERSTAND compiler and merged only into the slots the open clarification asked for (customer, product, quantity), into a new transcript (original + reply) whose spans stay valid; the merged state is re-evaluated and goes through the normal ACT pipeline. A reply naming actions is a new instruction; one that answers nothing asked, adds other facts, or contradicts what was understood changes nothing.
+
+Reason:
+A demo interface that shows fixed values, or success for steps that did not happen, undermines the system's central claim. The UI must be a view of the same state the API audit reports.

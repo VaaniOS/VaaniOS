@@ -318,11 +318,14 @@ def clarify_run(
     container: ContainerDep,
     principal: InstructorDep,
 ) -> WorkflowResponse:
-    """A complete corrected instruction for the principal's own open run."""
+    """
+    Answer the principal's own open run: a short reply is merged into the slots the
+    open clarification asked for; a complete instruction replaces the request.
+    """
     _instructable_run(container, run_id, principal)
     # Any approval still pending on this run is superseded; the response carries
     # the new approval_id if one is requested.
-    result = container.orchestrator.process_text(text=payload.clarification, run_id=run_id)
+    result = container.orchestrator.clarify(run_id=run_id, reply=payload.clarification)
     return _to_response(result)
 
 

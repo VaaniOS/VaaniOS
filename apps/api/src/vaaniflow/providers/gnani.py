@@ -74,6 +74,20 @@ class GnaniASRProvider:
         self._format = format
         self._itn_native_numerals = itn_native_numerals
 
+    @classmethod
+    def from_environment(
+        cls,
+        *,
+        format: str = DEFAULT_FORMAT,
+        itn_native_numerals: bool = False,
+    ) -> GnaniASRProvider:
+        """
+        Build the adapter with an SDK client configured from the environment
+        (``GNANI_API_KEY``, read by ``GnaniSTTClient``). Callers outside this
+        module never construct or import the Gnani SDK.
+        """
+        return cls(client=GnaniSTTClient(), format=format, itn_native_numerals=itn_native_numerals)
+
     def transcribe(
         self,
         *,

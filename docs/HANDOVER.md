@@ -1085,9 +1085,10 @@ Safety invariants that must never break (CLAUDE.md §2, 23 §23.6, 24):
 | KNOWN LIMITATION | ACT uses synthetic in-memory repositories only; nothing persists across restarts |
 | KNOWN LIMITATION | One line item per request; multi-item requests are clarified |
 | KNOWN LIMITATION | No catalog/operator pricing: no applicable quote → no voice sale (ADR-019); `ACCEPTED` quotes not executable (semantics undefined) |
-| KNOWN LIMITATION | `/clarify` takes a full new instruction; partial answers are not merged into the earlier request (the clarification record is preserved) |
-| KNOWN LIMITATION | Sandbox authentication only (ADR-022): static bearer tokens, no expiry/rotation; search and sandbox routes are open; the Telegram demo adapter authenticates only allowlisted user ids (`TELEGRAM_PRINCIPALS`), private chats only; its voice notes are not transcribed yet |
+| KNOWN LIMITATION | Clarification merging (ADR-023) fills only a missing/ambiguous customer, product or quantity of a single-item request; other gaps need the full corrected instruction |
+| KNOWN LIMITATION | Sandbox authentication only (ADR-022): static bearer tokens, no expiry/rotation; search and sandbox routes are open; the Telegram demo adapter authenticates only allowlisted user ids (`TELEGRAM_PRINCIPALS`), private chats only; voice notes need `GNANI_API_KEY` and FFmpeg (live Gnani unverified); run `python -m vaaniflow.presentation.serve` to share state with the API |
 | KNOWN LIMITATION | Only day-offset relative dates resolve; weekday/explicit dates linked to a rate → clarification |
+| KNOWN LIMITATION | Telegram voice notes leave local audio artifacts (original + preprocessed WAV) in `artifacts/` or `VAANIFLOW_ARTIFACT_DIR`, kept until deleted (no retention policy); `artifacts/` is git-ignored |
 | FUTURE FEATURE | Dashboard, TTS, persistence, production identity provider |
 
 ---

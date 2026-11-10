@@ -199,7 +199,10 @@ def test_unknown_telegram_user_is_denied_and_nothing_is_created() -> None:
 def test_unset_allowlist_denies_everyone() -> None:
     client = MockTelegramClient()
     bot = VaaniFlowTelegramBot(
-        token=TOKEN, client=client, identity=TelegramIdentityProvider.from_env({})
+        token=TOKEN,
+        repositories=SyntheticRepositories(),
+        client=client,
+        identity=TelegramIdentityProvider.from_env({}),
     )
     _send(bot, _msg(OWNER_ID, KUMAR))
     assert "not on this bot's allowlist" in client.sent_messages[-1]["text"]
